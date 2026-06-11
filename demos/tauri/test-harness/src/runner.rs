@@ -321,12 +321,14 @@ impl Runner {
                     .last_calendar_event_id = None;
             }
             Action::NotesInsert { pos, text } => {
-                let channel = self.current_channel(&step.actor).await?;
-                notes::notes_insert(&channel.notes, *pos, text).await?;
+                let (space, channel_id, _) = self.cur(&step.actor)?;
+                let doc = space.piece_text("channels", channel_id, "notes");
+                notes::notes_insert(&doc, *pos, text).await?;
             }
             Action::NotesDelete { pos, count } => {
-                let channel = self.current_channel(&step.actor).await?;
-                notes::notes_delete(&channel.notes, *pos, *count).await?;
+                let (space, channel_id, _) = self.cur(&step.actor)?;
+                let doc = space.piece_text("channels", channel_id, "notes");
+                notes::notes_delete(&doc, *pos, *count).await?;
             }
             Action::UploadFile {
                 parent_id,
@@ -433,8 +435,8 @@ impl Runner {
         Ok((actor.space.clone(), actor.current_channel_id, actor.user_id))
     }
 
-    /// Reload the actor's current channel row (yielding fresh `tasks` / `notes`
-    /// handles bound to the latest state).
+    /// Reload the actor's current channel row, yielding fresh list-backed
+    /// handles bound to the latest state.
     async fn current_channel(&self, actor_name: &str) -> Result<chat::Channel> {
         let actor = self.world.actor(actor_name)?;
         actor

@@ -229,16 +229,25 @@ export async function createFolderInode(parentId: number, name: string): Promise
 
 // ─── Shared Notes ──────────────────────────────────────────────────────────────
 
-export async function getNotes(): Promise<string> {
-  return invoke<string>("get_notes");
+export async function getNotes(channelId: number): Promise<string> {
+  return invoke<string>("get_notes", { channelId });
 }
 
-export async function notesInsert(pos: number, text: string): Promise<void> {
-  return invoke<void>("notes_insert", { pos, text });
+export async function notesInsert(channelId: number, pos: number, text: string): Promise<void> {
+  return invoke<void>("notes_insert", { channelId, pos, text });
 }
 
-export async function notesDelete(pos: number, count: number): Promise<void> {
-  return invoke<void>("notes_delete", { pos, count });
+export async function notesDelete(channelId: number, pos: number, count: number): Promise<void> {
+  return invoke<void>("notes_delete", { channelId, pos, count });
+}
+
+export async function notesApplyDiff(
+  channelId: number,
+  pos: number,
+  deleteCount: number,
+  inserted: string
+): Promise<void> {
+  return invoke<void>("notes_apply_diff", { channelId, pos, deleteCount, inserted });
 }
 
 // ─── Calendar ──────────────────────────────────────────────────────────────────
@@ -288,4 +297,3 @@ export async function logMessage(
 ): Promise<void> {
   return invoke<void>("log_message", { level, message });
 }
-

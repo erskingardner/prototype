@@ -1,9 +1,9 @@
 use super::{
     column_name_set, evaluate_acl, make_index_delete, make_index_put, parse_column_entries,
     read_acl_rule, read_schema_columns, read_schema_indexes, read_schema_list_columns,
-    unique_row_ids, validate_max_entries, validate_not_internal_table, validate_same_table,
-    validate_sorted_entries, validate_user_access, AclCheck, OpContext, OpReader, OpVerifier,
-    OpVerifyResult,
+    read_schema_piece_text_columns, unique_row_ids, validate_max_entries,
+    validate_not_internal_table, validate_same_table, validate_sorted_entries,
+    validate_user_access, AclCheck, OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, ReadOp, TraceStep};
@@ -45,6 +45,19 @@ impl OpVerifier for UpdateOp {
                 return Err(ChangelogError::Generic(format!(
                     "update: column '{col_name}' is a List column \
                      and cannot be modified by UPDATE — use list operations instead"
+                )));
+            }
+        }
+
+        // Reject updates to PieceText columns — they are managed by
+        // PieceTextEdit and their parent cell list_number is immutable after
+        // the row insert that allocated it.
+        let piece_text_cols = read_schema_piece_text_columns(table, reader, ctx)?;
+        for col_name in &actual {
+            if piece_text_cols.contains(*col_name) {
+                return Err(ChangelogError::Generic(format!(
+                    "update: column '{col_name}' is a PieceText column \
+                     and cannot be modified by UPDATE — use PieceTextEdit instead"
                 )));
             }
         }
@@ -216,6 +229,7 @@ mod tests {
         acl_rule_key, column_key, schema_columns_key as make_schema_key,
         schema_indexes_key as make_schema_indexes_key,
         schema_list_columns_key as make_schema_list_columns_key,
+        schema_piece_text_columns_key as make_schema_piece_text_columns_key,
     };
 
     /// Compact column-names value for table "t" with columns name, age.
@@ -354,6 +368,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key(table)),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key(table)),
+                results: vec![],
+            },
             no_acl_rule_read(table),
             schema_indexes_read(table, &[]),
             column_present_read(table, row_id, rep_column),
@@ -481,6 +499,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("t")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("t")),
+                results: vec![],
+            },
             no_acl_rule_read("t"),
             schema_indexes_read("t", &[]),
             // Representative column absent — row does not exist.
@@ -550,6 +572,46 @@ mod tests {
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("reserved"), "unexpected error: {msg}");
         assert!(msg.contains("_users"), "unexpected error: {msg}");
+    }
+
+    /// UPDATE cannot touch a PieceText column — those are managed by
+    /// PieceTextEdit and their parent cell list_number is immutable.
+    #[test]
+    fn test_update_op_rejects_piece_text_column() {
+        let col = column_key("docs", 1, "body");
+        let entry = make_entry_with_columns(1, std::slice::from_ref(&col), &[[0u8; 32].to_vec()]);
+        let sk = user_status_key(1);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_key("docs")),
+                results: vec![(make_schema_key("docs"), b"body".to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_list_columns_key("docs")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("docs")),
+                results: vec![(make_schema_piece_text_columns_key("docs"), b"body".to_vec())],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = UpdateOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::OpContext {
+                current_change_id: 0,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("PieceText column"), "unexpected error: {msg}");
+        assert!(msg.contains("body"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -653,6 +715,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("t")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("t")),
+                results: vec![],
+            },
             no_acl_rule_read("t"),
             schema_indexes_read("t", &["age"]),
             column_present_read("t", 5, "name"),
@@ -698,6 +764,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("t")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("t")),
                 results: vec![],
             },
             no_acl_rule_read("t"),
@@ -752,6 +822,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("t")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("t")),
                 results: vec![],
             },
             no_acl_rule_read("t"),
@@ -843,6 +917,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
+                results: vec![],
+            },
             // ACL blob
             acl_rule_read("posts", &author_id_acl_rule()),
             schema_indexes_read("posts", &[]),
@@ -906,6 +984,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
+                results: vec![],
+            },
             // ACL blob
             acl_rule_read("posts", &author_id_acl_rule()),
             // schema indexes (none for this table)
@@ -955,6 +1037,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
+                results: vec![],
+            },
             acl_rule_read("posts", &author_id_acl_rule()),
             schema_indexes_read("posts", &["author_id"]),
             column_value_read("posts", 5, "author_id", stored_i64(42)),
@@ -991,6 +1077,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
                 results: vec![],
             },
             acl_rule_read("posts", &author_id_acl_rule()),
@@ -1047,6 +1137,10 @@ mod tests {
             // list columns (none)
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
                 results: vec![],
             },
             // ACL blob
@@ -1110,6 +1204,10 @@ mod tests {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
                 results: vec![],
             },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
+                results: vec![],
+            },
             acl_rule_read("posts", &id_acl_rule()),
             schema_indexes_read("posts", &[]),
             column_present_read("posts", 1, "title"),
@@ -1160,6 +1258,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
                 results: vec![],
             },
             acl_rule_read("posts", &id_acl_rule()),
@@ -1215,6 +1317,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
                 results: vec![],
             },
             acl_rule_read("posts", &id_acl_rule()),
@@ -1275,6 +1381,10 @@ mod tests {
             },
             ProvenRead {
                 op: ReadOp::Key(make_schema_list_columns_key("posts")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_piece_text_columns_key("posts")),
                 results: vec![],
             },
             // ACL blob

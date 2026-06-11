@@ -48,3 +48,32 @@ table "_lists" {
     column "next_id"     type="int"  plaintext=#true
     column "value"       type="blob"
 }
+
+// Cleartext piece coordinates for `ColumnType::PieceText` documents.
+// Each row is one piece pointing into an encrypted `_piecetext_buffers` body.  The
+// `buffer_id` index is the authenticated lookup path used by the piece-
+// text verifier to resolve persistent byte coordinates.
+table "_piecetext_pieces" {
+    column "list_number" type="int" plaintext=#true indexed=#true
+    column "prev_id"     type="int" plaintext=#true
+    column "next_id"     type="int" plaintext=#true
+    column "buffer_id"   type="int" plaintext=#true indexed=#true
+    column "start_byte"  type="int" plaintext=#true
+    column "len_bytes"   type="int" plaintext=#true
+    column "tombstone"   type="int" plaintext=#true
+}
+
+// Encrypted piece-text buffer bodies plus cleartext owner metadata.
+// Ordinary app insert/update/delete paths reject this internal table;
+// `PieceTextEdit` is the only intended mutation path.  The owner_* columns
+// are indexed so cleanup can find a row's buffers; `contents` is the
+// SDK-encrypted body, hash-backed and never indexed.
+table "_piecetext_buffers" {
+    column "id"           type="int"    plaintext=#true
+    column "owner_table"  type="string" plaintext=#true indexed=#true
+    column "owner_row_id" type="int"    plaintext=#true indexed=#true
+    column "owner_column" type="string" plaintext=#true indexed=#true
+    column "author_id"    type="int"    plaintext=#true
+    column "len_bytes"    type="int"    plaintext=#true
+    column "contents"     type="blob"
+}

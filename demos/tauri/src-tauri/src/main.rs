@@ -226,6 +226,7 @@ fn main() {
             commands::get_notes,
             commands::notes_insert,
             commands::notes_delete,
+            commands::notes_apply_diff,
             commands::remove_user,
             commands::send_message_with_attachments,
             commands::get_attachments,

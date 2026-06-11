@@ -44,7 +44,7 @@ function SetupInner() {
         api.getMessages(user.current_channel_id),
         api.getReactions(user.current_channel_id),
         api.getTasks(),
-        api.getNotes(),
+        api.getNotes(user.current_channel_id),
       ]);
       dispatch({ type: "setChannels", channels });
       dispatch({ type: "setMessages", messages });
@@ -83,7 +83,7 @@ function SetupInner() {
         api.getMessages(user.current_channel_id),
         api.getReactions(user.current_channel_id),
         api.getTasks(),
-        api.getNotes(),
+        api.getNotes(user.current_channel_id),
       ]);
       dispatch({ type: "setChannels", channels });
       dispatch({ type: "setMessages", messages });
@@ -110,7 +110,7 @@ function SetupInner() {
         api.getMessages(user.current_channel_id),
         api.getReactions(user.current_channel_id),
         api.getTasks(),
-        api.getNotes(),
+        api.getNotes(user.current_channel_id),
       ]);
       dispatch({ type: "setChannels", channels });
       dispatch({ type: "setMessages", messages });

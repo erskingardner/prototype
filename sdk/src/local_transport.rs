@@ -312,6 +312,75 @@ impl LocalTransport {
         state.sigref_map.clear();
         Ok(())
     }
+
+    /// Test-only accessor for the in-memory `SpaceState` lock. Used by SDK
+    /// tests that need to seed parent rows or inspect the in-process server
+    /// changelog directly — low-level setup that has no public counterpart on
+    /// the transport.
+    #[cfg(any(test, feature = "local-transport"))]
+    pub async fn state_for_tests(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, encrypted_spaces_backend_server::SpaceState> {
+        self.state.lock().await
+    }
+
+    /// Seed an empty `_piecetext_pieces` document address (head/tail/parent schema
+    /// keys) for a piece-text column, and bump
+    /// `piece_coords_next_list_number_key` past the supplied `list_number`.
+    ///
+    /// Test-only helper. The caller must have already inserted the parent row
+    /// with the column carrying `list_number` as its value (e.g. via
+    /// `state_for_tests().db.insert(...)`). This writes the empty-document
+    /// backing state directly into the committed baseline — byte-for-byte the
+    /// same `_piecetext_pieces` head/tail/parent + counter state that insert-time
+    /// `InsertOp` allocation produces for a fresh document — so a fixture can
+    /// expose a shared piece-text document from genesis without a tracked
+    /// `OpType::Insert` change. After this returns, the in-process server is
+    /// ready to apply `OpType::PieceTextEdit` against the address.
+    ///
+    /// Resets the changelog baseline like [`Self::create_table`] does, so
+    /// subsequent tracked changes replay from the new post-init tree.
+    pub async fn init_piece_text_address(
+        &self,
+        table: &str,
+        row_id: i64,
+        column: &str,
+        list_number: i64,
+    ) -> Result<()> {
+        use encrypted_spaces_backend::merk_storage::Op;
+        use encrypted_spaces_storage_encoding::keys::{
+            encode_list_parent, piece_coords_head_key, piece_coords_next_list_number_key,
+            piece_coords_parent_key, piece_coords_tail_key,
+        };
+
+        let mut state = self.state.lock().await;
+        state.db.apply_batch_ops(vec![
+            (
+                piece_coords_head_key(list_number),
+                Op::Put(0i64.to_be_bytes().to_vec()),
+            ),
+            (
+                piece_coords_tail_key(list_number),
+                Op::Put(0i64.to_be_bytes().to_vec()),
+            ),
+            (
+                piece_coords_parent_key(list_number),
+                Op::Put(encode_list_parent(table, row_id, column)),
+            ),
+            (
+                piece_coords_next_list_number_key(),
+                Op::Put((list_number + 1).to_be_bytes().to_vec()),
+            ),
+        ])?;
+
+        let current_root = state.get_root_hash().await;
+        state.changelog = ChangeLog::new(&current_root);
+        state.change_responses.clear();
+        state.ff_proof = None;
+        state.tree_snapshot = state.db.snapshot();
+        state.sigref_map.clear();
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -531,6 +600,44 @@ impl crate::Space {
             // Server changelog baseline was reset out-of-band; per-user
             // sigref chains must restart so the next tracked change
             // (sig_ref=0) is accepted by `check_sigref_continuity`.
+            state.sigref_map.clear();
+            state.current_clc_state = crate::state::initial_clc_state(&new_root);
+        });
+        Ok(())
+    }
+
+    /// Test-only helper that seeds an empty `_piecetext_pieces` document address
+    /// in the local backend and resets the in-process changelog baseline.
+    /// See [`LocalTransport::init_piece_text_address`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if this `Space` was not constructed with a `LocalTransport`.
+    pub async fn init_piece_text_address(
+        &self,
+        table: &str,
+        row_id: i64,
+        column: &str,
+        list_number: i64,
+    ) -> Result<()> {
+        let local = self
+            .transport
+            .as_any()
+            .downcast_ref::<LocalTransport>()
+            .expect("Space::init_piece_text_address requires a LocalTransport-backed Space");
+        local
+            .init_piece_text_address(table, row_id, column, list_number)
+            .await?;
+
+        // The local transport reset its server changelog baseline; mirror that
+        // into client state so subsequent tracked changes start from the new
+        // post-init root with parent_change=0 (matching `create_table`).
+        let new_root = local.get_root_hash().await?;
+        self.with_state_mut(|state| {
+            state.current_data_commitment = new_root;
+            state.initial_dc = new_root;
+            state.current_change_id = 0;
+            state.my_last_change_id = 0;
             state.sigref_map.clear();
             state.current_clc_state = crate::state::initial_clc_state(&new_root);
         });

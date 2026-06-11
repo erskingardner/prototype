@@ -29,6 +29,7 @@ pub(crate) fn start_listener(space: &Space) {
     let updates_tx = space.updates_tx.clone();
     let serialize_mutations = Arc::clone(&space.serialize_mutations);
     let ff_in_progress = Arc::clone(&space.ff_in_progress);
+    let piece_text_caches = Arc::clone(&space.piece_text_caches);
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
@@ -45,6 +46,7 @@ pub(crate) fn start_listener(space: &Space) {
                         updates_tx: updates_tx.clone(),
                         serialize_mutations: Arc::clone(&serialize_mutations),
                         ff_in_progress: Arc::clone(&ff_in_progress),
+                        piece_text_caches: Arc::clone(&piece_text_caches),
                     };
                     space.handle_broadcast(evt.clone()).await;
                     drop(space);
@@ -109,5 +111,6 @@ impl Space {
         }
 
         crate::cache::update_cache_from_proven_writes(self, change, writes).await;
+        self.invalidate_piece_text_caches_for_change(&change.entry);
     }
 }

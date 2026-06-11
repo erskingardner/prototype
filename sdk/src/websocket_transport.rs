@@ -627,12 +627,19 @@ impl WebSocketTransport {
     }
 }
 
-fn change_request_from_change(change: &Change, retention_proofs: Vec<Vec<u8>>) -> ChangeRequest {
-    ChangeRequest {
+fn change_request_from_change(
+    change: &Change,
+    retention_proofs: Vec<Vec<u8>>,
+) -> Result<ChangeRequest> {
+    let values_sidecar = match crate::piecetext::piece_text_values_sidecar_for_wire(change) {
+        Some(result) => result?,
+        None => values_sidecar_to_proto(&change.hashed_values),
+    };
+    Ok(ChangeRequest {
         change: Some((&change.entry).into()),
-        values_sidecar: values_sidecar_to_proto(&change.hashed_values),
+        values_sidecar,
         retention_proofs,
-    }
+    })
 }
 
 fn change_from_broadcast_parts(entry: ChangelogEntry, response: &ChangeResponse) -> Change {
@@ -655,7 +662,7 @@ impl Transport for WebSocketTransport {
             operation: Some(db_request::Operation::Change(change_request_from_change(
                 change,
                 retention_proofs,
-            ))),
+            )?)),
         };
 
         let resp = self.send_request(req).await?;
@@ -740,7 +747,7 @@ impl Transport for WebSocketTransport {
             SdkError::ValidationError(format!("failed to serialize InviteRequest: {e}"))
         })?;
 
-        let insert_change_req = change_request_from_change(insert_change, vec![]);
+        let insert_change_req = change_request_from_change(insert_change, vec![])?;
 
         let req = DbRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -775,7 +782,7 @@ impl Transport for WebSocketTransport {
             SdkError::ValidationError(format!("failed to serialize RekeyRequest: {e}"))
         })?;
 
-        let delete_change_req = change_request_from_change(delete_change, vec![]);
+        let delete_change_req = change_request_from_change(delete_change, vec![])?;
 
         let req = DbRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -818,7 +825,7 @@ impl Transport for WebSocketTransport {
             None => None,
         };
 
-        let change_req = change_request_from_change(change, vec![]);
+        let change_req = change_request_from_change(change, vec![])?;
 
         let req = DbRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1026,7 +1033,7 @@ mod hash_backed_change_request_tests {
         hashed_values.insert(hashstore_hash(&full_value), full_value.clone());
         change.hashed_values = hashed_values;
 
-        let request = change_request_from_change(&change, vec![b"proof".to_vec()]);
+        let request = change_request_from_change(&change, vec![b"proof".to_vec()]).unwrap();
 
         assert_eq!(request.retention_proofs, vec![b"proof".to_vec()]);
         assert_eq!(request.values_sidecar, vec![full_value]);

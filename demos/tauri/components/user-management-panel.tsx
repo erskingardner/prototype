@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listenSafely } from "@/lib/tauri-events";
 import { useSpace } from "@/lib/store";
 import * as api from "@/lib/api";
 import type { UserRecord } from "@/lib/types";
@@ -45,12 +45,9 @@ export default function UserManagementPanel({ onClose }: Props) {
 
   // Re-fetch members when a broadcast arrives (user added/removed)
   useEffect(() => {
-    const unlisten = listen("space-updated", () => {
+    return listenSafely("space-updated", () => {
       loadMembers();
     });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   }, [loadMembers]);
 
   async function handleInvite() {

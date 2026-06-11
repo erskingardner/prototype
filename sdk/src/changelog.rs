@@ -11,8 +11,9 @@ use encrypted_spaces_backend::{
     sign_change::sign_change,
 };
 use encrypted_spaces_changelog_core::changelog::{
-    check_sigref_continuity as core_check_sigref_continuity, Change, ChangeLog, ChangeResponse,
-    ChangelogEntry, FastForwardData, HashedValues, OpType, MAX_PARENT_DISTANCE, ROOT_TREE_PATH,
+    check_sigref_continuity as core_check_sigref_continuity, classify_changelog_entry,
+    AuthenticationClass, Change, ChangeLog, ChangeResponse, ChangelogEntry, FastForwardData,
+    HashedValues, OpType, MAX_PARENT_DISTANCE, ROOT_TREE_PATH,
 };
 use encrypted_spaces_changelog_core::mmr_tree::{h_leaf, verify_with_leaf_hash};
 use encrypted_spaces_changelog_core::time::{
@@ -1084,10 +1085,19 @@ fn table_name_from_change_entry(entry: &ChangelogEntry) -> String {
         match parse_key(&e.key) {
             Ok(ParsedKey::Column { table, .. }) => return table,
             Ok(ParsedKey::Row { table, .. }) => return table,
+            Ok(ParsedKey::PieceTextEdit { table, .. }) => return table,
+            Ok(ParsedKey::PieceTextCleanupPieces { table, .. }) => return table,
+            Ok(ParsedKey::PieceTextCleanupBuffers { table, .. }) => return table,
             _ => continue,
         }
     }
     String::new()
+}
+
+fn is_system_source_entry(change: &ChangelogEntry) -> Result<bool> {
+    classify_changelog_entry(change)
+        .map(|class| matches!(class, AuthenticationClass::SystemSource))
+        .map_err(|e| SdkError::ValidationError(e.to_string()))
 }
 
 fn resolve_hashed_value(
@@ -1274,6 +1284,7 @@ impl Space {
                             state.cache.invalidate_table(t);
                         }
                     });
+                    self.invalidate_piece_text_caches_for_change(&change_entry);
                     BroadcastApplyOutcome::AppliedCacheInvalidated
                 } else {
                     BroadcastApplyOutcome::Applied { change, writes }
@@ -1322,6 +1333,14 @@ impl Space {
     ) -> SigVerifyOutcome {
         use encrypted_spaces_backend::sign_change::verify_change_signature;
         use encrypted_spaces_key_manager::DefaultSignature;
+
+        match classify_changelog_entry(change) {
+            Ok(AuthenticationClass::SystemSource) => return SigVerifyOutcome::Verified,
+            Ok(AuthenticationClass::UserSource) => {}
+            Err(e) => {
+                return SigVerifyOutcome::SignatureInvalid(SdkError::ValidationError(e.to_string()))
+            }
+        }
 
         if change.signature.is_empty() {
             return SigVerifyOutcome::SignatureInvalid(SdkError::ValidationError(
@@ -1457,13 +1476,17 @@ impl Space {
         )
         .map_err(|e| SdkError::DatabaseError(format!("verify_pruned_merkle_tree failed: {e:?}")))?;
 
+        let is_system_source = is_system_source_entry(change)?;
+
         // Sigref-chain continuity: a change's `sig_ref` must point at the
         // signer's previous accepted change_id (0 if this is their first).
         // The FF guest enforces this for proven ranges; this check covers
         // the single-change broadcast / direct-response path so the client
         // does not advance on a tail that the next FF proof would reject.
         // See issue #30.
-        check_sigref_continuity(change, expected_sig_ref)?;
+        if !is_system_source {
+            check_sigref_continuity(change, expected_sig_ref)?;
+        }
 
         self.apply_state_update(
             change,
@@ -1493,6 +1516,7 @@ impl Space {
         // prev_clc was captured atomically with current_change_id to prevent
         // races with the broadcast listener.
         let entry_bytes = change.as_bytes();
+        let is_system_source = is_system_source_entry(change)?;
 
         log::debug!(
             "[SDK] apply_state_update: change_id {} -> {} op={:?} entry_len={} prev_clc={}",
@@ -1529,17 +1553,19 @@ impl Space {
             state.current_data_commitment = response.new_root;
             state.current_change_id = current_change_id + 1;
             state.my_last_change_id = my_last_change_id;
-            // Advance the per-user sigref chain for `change.uid` (the signer).
-            // Guards subsequent ragged / single-change validation against
-            // out-of-order or replayed entries from the same user.
-            state.sigref_map.insert(change.uid, response.change_id);
+            if !is_system_source {
+                // Advance the per-user sigref chain for `change.uid` (the signer).
+                // Guards subsequent ragged / single-change validation against
+                // out-of-order or replayed entries from the same user.
+                state.sigref_map.insert(change.uid, response.change_id);
+            }
             state.timestamp_hwm = new_timestamp_hwm;
             // Extend the changelog commitment state with the entry.
             state.current_clc_state.append(&entry_bytes);
             // Store the entry as the changelog anchor for the next FF cycle's
             // `from_inclusion_proof` check.
             state.current_change_entry = Some(change.clone());
-            if change.uid == uid {
+            if !is_system_source && change.uid == uid {
                 state.my_last_change_id = response.change_id;
             }
             // Issue #212: discharge any pending local submission whose exact
@@ -1808,6 +1834,7 @@ impl Space {
             });
         }
         self.with_state_mut(|state| state.cache.clear_all());
+        self.mark_all_piece_text_caches_stale();
         let deadline = std::time::Instant::now() + FAST_FORWARD_RECOVERY_BUDGET;
         let mut attempt: u32 = 0;
         let outcome: Option<(std::collections::BTreeMap<Vec<u8>, i64>, bool)> = 'retry: loop {
@@ -2284,6 +2311,96 @@ impl Space {
         let mut ragged_cache_updates: Vec<(Change, Vec<BatchOp>)> = Vec::new();
 
         for (change, response) in ff_data.changes.iter().zip(ff_data.responses.iter()) {
+            // One pre-verification snapshot of current_change_id drives the
+            // already-applied skip, the contiguity guard, and the verification
+            // id. Reading current+1 a second time for verification (as a prior
+            // fix did) left a race: a concurrent broadcast / direct response
+            // applying this same ragged change between the skip and that re-read
+            // advances current, so an already-applied PieceText cleanup op would
+            // be verified with ctx.current_change_id == response.change_id + 1 and
+            // fail its exact `op_id == ctx.current_change_id` check before the
+            // post-verify skip could run.
+            let pre_verify_state = self.with_state(|state| {
+                if state.auth_context.uid.is_some() {
+                    Ok((state.current_change_id, state.timestamp_hwm))
+                } else {
+                    Err(SdkError::ValidationError(
+                        "User is not authenticated".to_string(),
+                    ))
+                }
+            });
+            let (current_before_verify, timestamp_hwm_before_verify) = match pre_verify_state {
+                Ok(values) => values,
+                Err(e) => return self.rollback_if_applied(&saved_state, applied_state, e),
+            };
+
+            // Already applied (e.g. by a concurrent validate_and_apply_change
+            // from an in-flight mutation): skip BEFORE verifying.
+            if response.change_id <= current_before_verify {
+                log::debug!(
+                    "[SDK] apply_fast_forward: skipping already-applied ragged change {} (current={})",
+                    response.change_id,
+                    current_before_verify
+                );
+                continue;
+            }
+
+            // Ragged changes must be contiguous with local verified state. A
+            // gap means state advanced/diverged underneath us (e.g. a broadcast
+            // applied a later change while this FF was in flight). Signal a
+            // fast-forward retry — `recover_via_fast_forward*` re-requests FF
+            // from a fresh anchor — rather than verifying this change against
+            // the wrong sequence position or failing hard.
+            if response.change_id != current_before_verify.saturating_add(1) {
+                log::debug!(
+                    "[SDK] apply_fast_forward: ragged change {} not contiguous with \
+                     current_change_id {} — signalling fast-forward retry",
+                    response.change_id,
+                    current_before_verify
+                );
+                return self.rollback_if_applied(
+                    &saved_state,
+                    applied_state,
+                    SdkError::FastForwardStateAdvanced,
+                );
+            }
+
+            let mut timestamp_hwm_after_verify = timestamp_hwm_before_verify;
+            if let Err(e) = validate_fast_forward_tail_timestamp_policy(
+                change,
+                response,
+                &mut timestamp_hwm_after_verify,
+            ) {
+                return self.rollback_if_applied(&saved_state, applied_state, e);
+            }
+
+            // Verify the change as #response.change_id (== current + 1, just
+            // checked). Using the change's own id rather than a fresh current+1
+            // read keeps verification correct even if a concurrent apply
+            // advances state between this snapshot and the verify call, so an
+            // op's exact change-id check (e.g. PieceText cleanup) still holds and
+            // the post-verify skip below can drop the now-already-applied change.
+            let writes = match ChangeLog::verify_proof_and_validate(
+                change,
+                &response.pruned_merkle_tree,
+                &response.old_root,
+                &response.new_root,
+                response.change_id as usize,
+            ) {
+                Ok(writes) => writes,
+                Err(e) => {
+                    return self.rollback_if_applied(
+                        &saved_state,
+                        applied_state,
+                        SdkError::DatabaseError(format!("verify_pruned_merkle_tree failed: {e:?}")),
+                    );
+                }
+            };
+            let table = table_name_from_change_entry(change);
+            if let Some(row_id) = crate::cache::new_row_id_for_table(self, &writes, &table) {
+                inserted_ids.insert(change.signature.clone(), row_id);
+            }
+
             let state_values = self.with_state(|state| {
                 if let Some(uid) = state.auth_context.uid {
                     let expected_sig_ref = state.sigref_map.get(&change.uid).copied().unwrap_or(0);
@@ -2324,6 +2441,20 @@ impl Space {
                 continue;
             }
 
+            if response.change_id != current_change_id.saturating_add(1) {
+                log::debug!(
+                    "[SDK] apply_fast_forward: ragged change {} not contiguous with \
+                     current_change_id {} after verification — signalling fast-forward retry",
+                    response.change_id,
+                    current_change_id
+                );
+                return self.rollback_if_applied(
+                    &saved_state,
+                    applied_state,
+                    SdkError::FastForwardStateAdvanced,
+                );
+            }
+
             let mut new_timestamp_hwm = timestamp_hwm;
             if let Err(e) = validate_fast_forward_tail_timestamp_policy(
                 change,
@@ -2333,37 +2464,20 @@ impl Space {
                 return self.rollback_if_applied(&saved_state, applied_state, e);
             }
 
-            // The state's current_change_id reflects what we've already
-            // applied; the incoming change becomes #(current+1).
-            let next_change_id = (current_change_id as usize).saturating_add(1);
-            let writes = match ChangeLog::verify_proof_and_validate(
-                change,
-                &response.pruned_merkle_tree,
-                &response.old_root,
-                &response.new_root,
-                next_change_id,
-            ) {
-                Ok(writes) => writes,
-                Err(e) => {
-                    return self.rollback_if_applied(
-                        &saved_state,
-                        applied_state,
-                        SdkError::DatabaseError(format!("verify_pruned_merkle_tree failed: {e:?}")),
-                    );
-                }
+            let is_system_source = match is_system_source_entry(change) {
+                Ok(value) => value,
+                Err(e) => return self.rollback_if_applied(&saved_state, applied_state, e),
             };
-            let table = table_name_from_change_entry(change);
-            if let Some(row_id) = crate::cache::new_row_id_for_table(self, &writes, &table) {
-                inserted_ids.insert(change.signature.clone(), row_id);
-            }
 
             // Sigref-chain continuity for ragged changes (issue #30).
             // The FF guest only enforces this for proven ranges; without
             // this check the client could advance on a tail that the next
             // FF would reject. Snapshot read above + CAS in
             // `apply_state_update` keep the check atomic w.r.t. broadcasts.
-            if let Err(e) = check_sigref_continuity(change, expected_sig_ref) {
-                return self.rollback_if_applied(&saved_state, applied_state, e);
+            if !is_system_source {
+                if let Err(e) = check_sigref_continuity(change, expected_sig_ref) {
+                    return self.rollback_if_applied(&saved_state, applied_state, e);
+                }
             }
 
             if let Err(e) = self.apply_state_update(
@@ -2589,6 +2703,67 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum CleanupEntryKind {
+        Pieces,
+        Buffers,
+    }
+
+    impl CleanupEntryKind {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Pieces => "PieceTextCleanupPieces",
+                Self::Buffers => "PieceTextCleanupBuffers",
+            }
+        }
+    }
+
+    fn cleanup_entry_kinds() -> [CleanupEntryKind; 2] {
+        [CleanupEntryKind::Pieces, CleanupEntryKind::Buffers]
+    }
+
+    fn make_cleanup_entry(kind: CleanupEntryKind) -> ChangelogEntry {
+        use encrypted_spaces_changelog_core::piece_text::PieceTextAddress;
+        use encrypted_spaces_changelog_core::piece_text_cleanup::{
+            PieceTextCleanupBuffersEnvelopeV1, PieceTextCleanupPiecesEnvelopeV1,
+            PieceTextCleanupRunV1, PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+        };
+
+        let address = PieceTextAddress {
+            table: "docs".to_string(),
+            row_id: 1,
+            column: "body".to_string(),
+        };
+        let message = match kind {
+            CleanupEntryKind::Pieces => PieceTextCleanupPiecesEnvelopeV1 {
+                version: PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+                address,
+                list_number: 4,
+                op_id: 9,
+                runs: vec![PieceTextCleanupRunV1 { removals: vec![12] }],
+            }
+            .changelog_message()
+            .unwrap(),
+            CleanupEntryKind::Buffers => PieceTextCleanupBuffersEnvelopeV1 {
+                version: PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+                address,
+                op_id: 9,
+                buffer_removals: vec![21],
+            }
+            .changelog_message()
+            .unwrap(),
+        };
+        ChangelogEntry {
+            timestamp: 1000,
+            uid: 0,
+            parent_change: 8,
+            message,
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
+    }
+
     fn entry_leaf_hash(entry: &ChangelogEntry) -> [u8; 32] {
         (*h_leaf(&entry.as_bytes()).as_bytes())
             .try_into()
@@ -2775,6 +2950,177 @@ mod tests {
         sigref_entries.insert(2, entry_b);
 
         assert!(validate_sigref_entries(&sigref_map, &sigref_entries).is_ok());
+    }
+
+    #[test]
+    fn piece_text_cleanup_is_system_source_entry() {
+        for kind in cleanup_entry_kinds() {
+            let entry = make_cleanup_entry(kind);
+            assert!(
+                is_system_source_entry(&entry).unwrap(),
+                "{} should be system-source",
+                kind.label()
+            );
+        }
+    }
+
+    /// Minimal real `Space` (over `LocalTransport`) for the FF ragged-loop
+    /// tests below. Mirrors `hash_backed_change_tests::create_hash_backed_space`
+    /// but lives in this module so it can sit alongside `make_cleanup_entry`.
+    #[cfg(feature = "local-transport")]
+    async fn make_space_for_ff_tests() -> Result<Space> {
+        use crate::local_transport::LocalTransport;
+        use crate::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
+
+        let schema = SchemaBuilder::new("messages")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("content", ColumnType::Text)?
+            .column("title", ColumnType::String)?
+            .plaintext()
+            .build()?;
+        let transport = LocalTransport::new(
+            std::slice::from_ref(&schema),
+            None,
+            Some(encrypted_spaces_backend_server::SpaceState::DEFAULT_FF_BATCH_SIZE),
+        )
+        .await?;
+        let root = transport.get_root_hash().await?;
+        Space::create(
+            transport,
+            ApplicationSchema::for_testing(vec![schema], root),
+        )
+        .await
+    }
+
+    /// Regression for the FF ragged-change race (F3). A `PieceTextCleanup` that
+    /// a concurrent broadcast already applied (so `response.change_id <=
+    /// current_change_id`) must be SKIPPED before `verify_proof_and_validate`
+    /// runs. Verifying it would use an advanced sequence id and fail the cleanup
+    /// op's exact `op_id == ctx.current_change_id` check, turning an
+    /// already-applied change into a spurious FF rollback. The ragged entry
+    /// carries a deliberately invalid (empty) pruned tree: under the bug the
+    /// pre-skip verify would error deserializing it; the fix must skip it
+    /// untouched.
+    ///
+    /// Note: this covers the already-applied-at-loop-entry skip (the primary
+    /// failure mode). It does not exercise the mid-loop race where state
+    /// advances *during* the loop and verification then runs with
+    /// `response.change_id` — that needs a valid cleanup FF proof (the
+    /// un-ported FF-core cleanup fixtures, tracked separately).
+    #[cfg(feature = "local-transport")]
+    #[tokio::test]
+    async fn apply_fast_forward_skips_already_applied_cleanup_without_verifying() -> Result<()> {
+        use encrypted_spaces_changelog_core::changelog::FastForwardServerHead;
+
+        for kind in cleanup_entry_kinds() {
+            let space = make_space_for_ff_tests().await?;
+
+            // Snapshot the client's verified head. The cleanup is delivered with
+            // change_id == current, i.e. already applied.
+            let (current, clc_prefix, dc_prefix) = space.with_state(|state| {
+                let clc: [u8; 32] = state.current_clc_state.root.into();
+                let mut clc_prefix = [0u8; 16];
+                clc_prefix.copy_from_slice(&clc[..16]);
+                let mut dc_prefix = [0u8; 16];
+                dc_prefix.copy_from_slice(&state.current_data_commitment[..16]);
+                (state.current_change_id, clc_prefix, dc_prefix)
+            });
+
+            let ff_data = FastForwardData {
+                proof: None,
+                changes: vec![make_cleanup_entry(kind)],
+                responses: vec![ChangeResponse {
+                    change_id: current,
+                    old_root: [0u8; 32],
+                    new_root: [0u8; 32],
+                    // Invalid on purpose: the fix must skip before verifying, so
+                    // this is never deserialized.
+                    pruned_merkle_tree: Vec::new(),
+                    rows_affected: 0,
+                    accepted_at_server_time: ChangelogEntry::get_unix_timestamp(),
+                    hashed_values: HashedValues::new(),
+                }],
+                server_head: Some(FastForwardServerHead {
+                    change_id: current,
+                    clc_prefix,
+                    data_commitment_prefix: dc_prefix,
+                }),
+            };
+
+            space
+                .apply_fast_forward(ff_data)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{} already-applied cleanup must be skipped, not verified: {err}",
+                        kind.label()
+                    )
+                });
+
+            assert_eq!(
+                space.with_state(|state| state.current_change_id),
+                current,
+                "{} skipped cleanup must not advance current_change_id",
+                kind.label()
+            );
+        }
+        Ok(())
+    }
+
+    /// The FF contiguity guard (F3): a ragged change beyond `current + 1` means
+    /// local state diverged underneath us, so FF must bail rather than verify
+    /// the change against the wrong sequence position.
+    #[cfg(feature = "local-transport")]
+    #[tokio::test]
+    async fn apply_fast_forward_rejects_noncontiguous_ragged_change() -> Result<()> {
+        use encrypted_spaces_changelog_core::changelog::FastForwardServerHead;
+
+        for kind in cleanup_entry_kinds() {
+            let space = make_space_for_ff_tests().await?;
+            let current = space.with_state(|state| state.current_change_id);
+            let gap_change_id = current + 2; // skips current + 1
+
+            let ff_data = FastForwardData {
+                proof: None,
+                changes: vec![make_cleanup_entry(kind)],
+                responses: vec![ChangeResponse {
+                    change_id: gap_change_id,
+                    old_root: [0u8; 32],
+                    new_root: [0u8; 32],
+                    pruned_merkle_tree: Vec::new(),
+                    rows_affected: 0,
+                    accepted_at_server_time: ChangelogEntry::get_unix_timestamp(),
+                    hashed_values: HashedValues::new(),
+                }],
+                server_head: Some(FastForwardServerHead {
+                    change_id: gap_change_id,
+                    clc_prefix: [0u8; 16],
+                    data_commitment_prefix: [0u8; 16],
+                }),
+            };
+
+            let err = space.apply_fast_forward(ff_data).await.unwrap_err();
+            assert!(
+                matches!(err, SdkError::FastForwardStateAdvanced),
+                "{} expected FastForwardStateAdvanced, got: {err}",
+                kind.label()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn table_name_from_change_entry_handles_piece_text_cleanup() {
+        for kind in cleanup_entry_kinds() {
+            let entry = make_cleanup_entry(kind);
+            assert_eq!(
+                table_name_from_change_entry(&entry),
+                "docs",
+                "{} should expose the addressed table",
+                kind.label()
+            );
+        }
     }
 
     /// Regression for #30: `check_sigref_continuity` enforces the

@@ -7,6 +7,9 @@ pub mod invite_user_op;
 pub mod list_op;
 #[cfg(test)]
 mod op_tests;
+pub mod piece_text_cleanup_buffers_op;
+pub mod piece_text_cleanup_pieces_op;
+pub mod piece_text_edit_op;
 pub mod reduce_op;
 pub mod refresh_keys_op;
 pub mod rekey_op;
@@ -20,8 +23,8 @@ use encrypted_spaces_storage_encoding::keys::{
     acl_only_via_actions_key, acl_rule_key, action_storage_key, column_key, decode_action_value,
     index_key, index_value_prefix, parse_column_key_ref, parse_key, row_id_to_bytes, row_key,
     schema_columns_key, schema_id_mode_key, schema_indexes_key, schema_list_columns_key,
-    schema_next_id_key, ParsedKey, TupleConversionError, KEY_HISTORY_TABLE, RETENTION_TABLE,
-    USERS_TABLE,
+    schema_next_id_key, schema_piece_text_columns_key, ParsedKey, TupleConversionError,
+    KEY_HISTORY_TABLE, RETENTION_TABLE, USERS_TABLE,
 };
 use encrypted_spaces_storage_encoding::stored_value::{bytes_to_value, value_to_bytes};
 use encrypted_spaces_storage_encoding::{decode_column_names, TupleElement};
@@ -38,6 +41,9 @@ pub use extend_op::ExtendOp;
 pub use insert_op::InsertOp;
 pub use invite_user_op::InviteUserOp;
 pub use list_op::{ListAppendOp, ListDeleteOp, ListInsertOp, ListUpdateOp};
+pub use piece_text_cleanup_buffers_op::PieceTextCleanupBuffersOp;
+pub use piece_text_cleanup_pieces_op::PieceTextCleanupPiecesOp;
+pub use piece_text_edit_op::{PieceTextEditExecutionMetrics, PieceTextEditOp};
 pub use reduce_op::ReduceOp;
 pub use refresh_keys_op::{RefreshKeysOp, REFRESH_KEYS_ALLOWED_COLUMNS};
 pub use rekey_op::RekeyOp;
@@ -1297,6 +1303,43 @@ pub(crate) fn read_schema_list_columns(
     Ok(lc)
 }
 
+/// Read the schema's PieceText column-name set, treating an absent key as
+/// "no PieceText columns" rather than an error.  Mirrors
+/// [`read_schema_list_columns`]; PieceText and List columns live in
+/// independent namespaces.
+pub(crate) fn read_schema_piece_text_columns(
+    table: &str,
+    reader: &mut dyn OpReader,
+    ctx: &OpContext,
+) -> Result<BTreeSet<String>, ChangelogError> {
+    if let Some(pt) = ctx
+        .static_cache
+        .state
+        .borrow()
+        .schema_piece_text_columns
+        .get(table)
+    {
+        return Ok(pt.clone());
+    }
+    let key = schema_piece_text_columns_key(table);
+    let read = reader.read(ReadOp::Key(key))?;
+    let pt = match read.results.first() {
+        Some((_, bytes)) => encrypted_spaces_storage_encoding::decode_column_names(bytes)
+            .ok_or_else(|| {
+                ChangelogError::Generic(format!(
+                    "failed to decode piece_text column names for table '{table}'"
+                ))
+            })?,
+        None => BTreeSet::new(),
+    };
+    ctx.static_cache
+        .state
+        .borrow_mut()
+        .schema_piece_text_columns
+        .insert(table.to_string(), pt.clone());
+    Ok(pt)
+}
+
 /// Build a `BatchOp::Put` for an index entry from a raw column value.
 ///
 /// Parses `value_bytes` as JSON, converts to `TupleElement`, constructs the
@@ -1934,6 +1977,7 @@ pub struct OpVerifyResult {
 struct StaticMetadataCacheState {
     schema_columns: BTreeMap<String, BTreeSet<String>>,
     schema_list_columns: BTreeMap<String, BTreeSet<String>>,
+    schema_piece_text_columns: BTreeMap<String, BTreeSet<String>>,
     schema_indexes: BTreeMap<String, BTreeSet<String>>,
     acl_rules: BTreeMap<(String, String), Option<AccessRule>>,
     actions: BTreeMap<(String, String), Option<Action>>,
@@ -1945,6 +1989,7 @@ impl StaticMetadataCacheState {
     fn clear(&mut self) {
         self.schema_columns.clear();
         self.schema_list_columns.clear();
+        self.schema_piece_text_columns.clear();
         self.schema_indexes.clear();
         self.acl_rules.clear();
         self.actions.clear();
@@ -2083,6 +2128,13 @@ pub fn dispatch_extract_and_validate(
         OpType::Reduce => ReduceOp::extract_and_validate(entry, reader, ctx),
         OpType::Rekey => RekeyOp::extract_and_validate(entry, reader, ctx),
         OpType::Action => ActionOp::extract_and_validate(entry, reader, ctx),
+        OpType::PieceTextEdit => PieceTextEditOp::extract_and_validate(entry, reader, ctx),
+        OpType::PieceTextCleanupPieces => {
+            PieceTextCleanupPiecesOp::extract_and_validate(entry, reader, ctx)
+        }
+        OpType::PieceTextCleanupBuffers => {
+            PieceTextCleanupBuffersOp::extract_and_validate(entry, reader, ctx)
+        }
         OpType::Noop => Ok(OpVerifyResult {
             write_steps: Vec::new(),
         }),

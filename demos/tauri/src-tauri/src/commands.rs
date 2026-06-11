@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use encrypted_spaces_sdk::{
-    load_trust_cert, List, Space, SpaceInvite, TextArea, WebSocketTransport,
-};
+use encrypted_spaces_sdk::{load_trust_cert, List, Space, SpaceInvite, WebSocketTransport};
 
 use crate::broadcast::{start_broadcast_listener, start_ephemeral_listener};
 use crate::chat;
@@ -73,16 +71,6 @@ async fn init_space_common(
         .await
         .map_err(|e| format!("channel creation failed: {e}"))?;
 
-    // Select the channel row to get the hydrated TextArea from it.
-    let channel: chat::Channel = space
-        .table::<chat::Channel>("channels")
-        .select()
-        .where_eq("id", channel_id)
-        .first()
-        .await
-        .map_err(|e| format!("channel select failed: {e}"))?
-        .ok_or("channel not found after creation")?;
-
     let user_info = UserInfo {
         user_id: uid,
         user_name: user_name.to_string(),
@@ -109,7 +97,7 @@ async fn init_space_common(
     }
     {
         let mut p = app_state.notes.lock().await;
-        *p = Some(channel.notes);
+        *p = Some(space.piece_text("channels", channel_id, "notes"));
     }
     {
         let mut u = app_state.user_info.lock().await;
@@ -327,7 +315,7 @@ pub async fn create_channel(
         name,
         description: None,
         tasks: List::empty(),
-        notes: TextArea::empty(),
+        notes: encrypted_spaces_sdk::PieceCoordList::empty(),
     })
 }
 
@@ -352,22 +340,23 @@ pub async fn switch_channel(
     channel_id: i64,
     channel_name: String,
 ) -> Result<(), String> {
-    // Update the notes TextArea for the new channel.
-    let channel = {
-        let space = state.space.lock().await;
-        let space = space.as_ref().ok_or("space not initialized")?;
-        space
-            .table::<chat::Channel>("channels")
-            .select()
-            .where_eq("id", channel_id)
-            .first()
-            .await
-            .map_err(|e| format!("channel select failed: {e}"))?
-            .ok_or("channel not found")?
+    // Update the PieceText handle for the new channel.
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
     };
+    space
+        .table::<serde_json::Value>("channels")
+        .select()
+        .columns(&["id"])
+        .where_eq("id", channel_id)
+        .first()
+        .await
+        .map_err(|e| format!("channel select failed: {e}"))?
+        .ok_or("channel not found")?;
     {
         let mut p = state.notes.lock().await;
-        *p = Some(channel.notes);
+        *p = Some(space.piece_text("channels", channel_id, "notes"));
     }
     let mut user_guard = state.user_info.lock().await;
     let user = user_guard.as_mut().ok_or("user not initialized")?;
@@ -570,7 +559,7 @@ pub async fn get_users(state: State<'_, AppState>) -> Result<Vec<chat::UserInfo>
 }
 
 /// Get the current channel by selecting it from the table.
-/// Returns the hydrated Channel with its List/TextArea fields ready to use.
+/// Returns the hydrated Channel with its list-backed fields ready to use.
 async fn current_channel(state: &AppState) -> Result<chat::Channel, String> {
     let space = {
         let guard = state.space.lock().await;
@@ -644,11 +633,25 @@ pub async fn delete_task(state: State<'_, AppState>, key: String) -> Result<(), 
 
 // ─── Shared Notes Commands ─────────────────────────────────────────────────────
 
+async fn notes_doc_for_channel(
+    state: &AppState,
+    channel_id: i64,
+) -> Result<encrypted_spaces_sdk::PieceTextArea, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    Ok(space.piece_text("channels", channel_id, "notes"))
+}
+
 #[tauri::command]
-pub async fn get_notes(state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.notes.lock().await;
-    let doc = guard.as_ref().ok_or("notes not initialized")?;
-    crate::notes::get_notes_text(doc)
+pub async fn get_notes(state: State<'_, AppState>, channel_id: i64) -> Result<String, String> {
+    get_notes_impl(state.inner(), channel_id).await
+}
+
+pub(crate) async fn get_notes_impl(state: &AppState, channel_id: i64) -> Result<String, String> {
+    let doc = notes_doc_for_channel(state, channel_id).await?;
+    crate::notes::get_notes_text(&doc)
         .await
         .map_err(|e| format!("get notes failed: {e}"))
 }
@@ -656,12 +659,26 @@ pub async fn get_notes(state: State<'_, AppState>) -> Result<String, String> {
 #[tauri::command]
 pub async fn notes_insert(
     state: State<'_, AppState>,
+    channel_id: i64,
     pos: usize,
     text: String,
 ) -> Result<(), String> {
-    let guard = state.notes.lock().await;
-    let doc = guard.as_ref().ok_or("notes not initialized")?;
-    crate::notes::notes_insert(doc, pos, &text)
+    notes_insert_impl(state.inner(), channel_id, pos, &text).await
+}
+
+/// Body of the `notes_insert` command, split from the `#[tauri::command]`
+/// wrapper so the UTF-16 → scalar command path is unit-testable without a Tauri
+/// `State` harness.
+pub(crate) async fn notes_insert_impl(
+    state: &AppState,
+    channel_id: i64,
+    pos: usize,
+    text: &str,
+) -> Result<(), String> {
+    let doc = notes_doc_for_channel(state, channel_id).await?;
+    // `pos` arrives as a UTF-16 code-unit offset from the frontend; convert it
+    // to a scalar offset for the scalar-indexed notes API.
+    crate::notes::notes_insert_utf16(&doc, pos, text)
         .await
         .map_err(|e| format!("notes insert failed: {e}"))
 }
@@ -669,14 +686,51 @@ pub async fn notes_insert(
 #[tauri::command]
 pub async fn notes_delete(
     state: State<'_, AppState>,
+    channel_id: i64,
     pos: usize,
     count: usize,
 ) -> Result<(), String> {
-    let guard = state.notes.lock().await;
-    let doc = guard.as_ref().ok_or("notes not initialized")?;
-    crate::notes::notes_delete(doc, pos, count)
+    notes_delete_impl(state.inner(), channel_id, pos, count).await
+}
+
+/// Body of the `notes_delete` command, split from the `#[tauri::command]`
+/// wrapper for the same unit-testability reason as [`notes_insert_impl`].
+pub(crate) async fn notes_delete_impl(
+    state: &AppState,
+    channel_id: i64,
+    pos: usize,
+    count: usize,
+) -> Result<(), String> {
+    let doc = notes_doc_for_channel(state, channel_id).await?;
+    // `pos`/`count` arrive as UTF-16 code-unit values from the frontend; convert
+    // both endpoints to scalar offsets for the scalar-indexed notes API.
+    crate::notes::notes_delete_utf16(&doc, pos, count)
         .await
         .map_err(|e| format!("notes delete failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn notes_apply_diff(
+    state: State<'_, AppState>,
+    channel_id: i64,
+    pos: usize,
+    delete_count: usize,
+    inserted: String,
+) -> Result<(), String> {
+    notes_apply_diff_impl(state.inner(), channel_id, pos, delete_count, &inserted).await
+}
+
+pub(crate) async fn notes_apply_diff_impl(
+    state: &AppState,
+    channel_id: i64,
+    pos: usize,
+    delete_count: usize,
+    inserted: &str,
+) -> Result<(), String> {
+    let doc = notes_doc_for_channel(state, channel_id).await?;
+    crate::notes::notes_apply_diff_utf16(&doc, pos, delete_count, inserted)
+        .await
+        .map_err(|e| format!("notes apply diff failed: {e}"))
 }
 
 // ─── Attachments ────────────────────────────────────────────────────────────

@@ -461,7 +461,7 @@ fn column_rust_type(col: &ColumnDefinition) -> &'static str {
         // the schema declares the list's item type, the row carries the
         // raw anchor; callers wrap it in a `encrypted_spaces_sdk::List<T>`
         // at the boundary.
-        ColumnType::List => "i64",
+        ColumnType::List | ColumnType::PieceText => "i64",
     }
 }
 
@@ -469,7 +469,9 @@ fn column_rust_type(col: &ColumnDefinition) -> &'static str {
 /// builder's setter) to the corresponding `QueryParam` constructor.
 fn row_field_to_query_param(col: &ColumnDefinition, expr: &str) -> String {
     match col.column_type {
-        ColumnType::Integer | ColumnType::List => format!("QueryParam::Integer({expr})"),
+        ColumnType::Integer | ColumnType::List | ColumnType::PieceText => {
+            format!("QueryParam::Integer({expr})")
+        }
         ColumnType::Real => format!("QueryParam::Real({expr})"),
         ColumnType::String | ColumnType::Text => format!("QueryParam::Text({expr}.clone())"),
         ColumnType::FileRef => format!("QueryParam::Text({expr}.hash()?.to_string())"),

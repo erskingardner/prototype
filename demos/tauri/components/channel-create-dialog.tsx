@@ -41,7 +41,7 @@ export default function ChannelCreateDialog({ onClose }: Props) {
           api.getMessages(channel.id),
           api.getReactions(channel.id),
           api.getTasks(),
-          api.getNotes(),
+          api.getNotes(channel.id),
         ]);
         dispatch({ type: "setMessages", messages });
         dispatch({ type: "setReactions", reactions });

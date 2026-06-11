@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use encrypted_spaces_sdk::{Space, TextArea};
+use encrypted_spaces_sdk::{PieceTextArea, Space};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -17,7 +17,7 @@ pub struct AppState {
     pub space: tokio::sync::Mutex<Option<Arc<Space>>>,
     pub user_info: tokio::sync::Mutex<Option<UserInfo>>,
     pub snapshot_path: tokio::sync::Mutex<Option<PathBuf>>,
-    pub notes: tokio::sync::Mutex<Option<TextArea>>,
+    pub notes: tokio::sync::Mutex<Option<PieceTextArea>>,
     pub default_zoom: u32,
     /// Extra TLS trust anchor file path from `--trust-cert` / the
     /// `ENCRYPTED_SPACES_TRUST_CERT` env var. Re-read from disk on every

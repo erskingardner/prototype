@@ -356,7 +356,7 @@ fn query_param_matches_column_type(param: &QueryParam, column_type: &ColumnType)
             matches!(param, QueryParam::Text(_))
         }
         ColumnType::Blob => matches!(param, QueryParam::Blob(_)),
-        ColumnType::List => matches!(param, QueryParam::Integer(_)),
+        ColumnType::List | ColumnType::PieceText => matches!(param, QueryParam::Integer(_)),
     }
 }
 

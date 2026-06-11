@@ -17,9 +17,13 @@ pub use id_validation::{classify_insert_id, IdValidationError, InsertId};
 pub use keys::{
     acl_only_via_actions_key, acl_rule_key, action_marker_key, action_storage_key, bytes_to_row_id,
     column_key_placeholder, decode_action_value, encode_action_value, index_column_prefix,
-    index_key, index_value_prefix, parse_column_key_ref, parse_key, row_id_to_bytes, row_key,
-    row_prefix, schema_columns_key, schema_indexes_key, schema_key, users_row_key, ColumnKeyRef,
-    KeyError, ParsedKey, TupleConversionError, ACTION_STORAGE_VERSION, RETENTION_TABLE,
+    index_key, index_value_prefix, parse_column_key_ref, parse_key, piece_coords_head_key,
+    piece_coords_next_list_number_key, piece_coords_parent_key, piece_coords_tail_key,
+    piece_text_cleanup_buffers_key, piece_text_cleanup_pieces_key, piece_text_edit_key,
+    row_id_to_bytes, row_key, row_prefix, schema_columns_key, schema_indexes_key, schema_key,
+    schema_piece_text_columns_key, users_row_key, ColumnKeyRef, KeyError, ParsedKey,
+    TupleConversionError, ACTION_STORAGE_VERSION, BUFFERS_TABLE, PIECE_COORDS_TABLE,
+    RETENTION_TABLE, TAG_PIECE_TEXT, TAG_PIECE_TEXT_CLEANUP_BUFFERS, TAG_PIECE_TEXT_CLEANUP_PIECES,
     USERS_TABLE,
 };
 pub use tuple::{decode_tuple, encode_tuple, DecodeError, TupleElement};

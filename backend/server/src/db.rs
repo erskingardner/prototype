@@ -4,7 +4,8 @@ use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
 use encrypted_spaces_backend::internal_schemas::RETENTION_TABLE_NAME;
 use encrypted_spaces_backend::internal_schemas::{
-    is_internal_table, is_reserved_table_name, LISTS_TABLE_NAME, USERS_TABLE_NAME,
+    is_internal_table, is_reserved_table_name, BUFFERS_TABLE_NAME, LISTS_TABLE_NAME,
+    PIECE_COORDS_TABLE_NAME, USERS_TABLE_NAME,
 };
 use encrypted_spaces_backend::merk_storage::{
     group_columns_into_rows_by_table_resolving_hashes, parse_key, Op, ParsedKey,
@@ -29,6 +30,10 @@ use encrypted_spaces_changelog_core::changelog::{
     HashedValues, KvData, OpType, MAX_LOGMSG_ENTRIES, MAX_PARENT_DISTANCE,
 };
 use encrypted_spaces_changelog_core::ops::extract_row_id_from_invite_user_proof;
+use encrypted_spaces_changelog_core::piece_text::PieceTextEditEnvelopeV1;
+use encrypted_spaces_changelog_core::piece_text_cleanup::{
+    PieceTextCleanupBuffersEnvelopeV1, PieceTextCleanupPiecesEnvelopeV1,
+};
 use encrypted_spaces_changelog_core::time::validate_change_timestamp_at_acceptance;
 use encrypted_spaces_crypto::signature::Ed25519Signature;
 use encrypted_spaces_crypto::KeyCommitment;
@@ -49,6 +54,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::{fs, io::Write};
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+pub(crate) mod piece_text_cleanup;
+mod piece_text_edit;
+pub mod piece_text_invariants;
 
 type AuthVerifyingKey = <Ed25519Signature as Signature>::VerificationKey;
 
@@ -157,6 +166,12 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Delayed cleanup bookkeeping for PieceText tombstones.
+    pub(crate) cleanup_state: piece_text_cleanup::CleanupState,
+    /// Optional broadcaster used by the cleanup worker after committing a
+    /// server-produced cleanup changelog entry. Set by the websocket layer (in
+    /// the binary crate) and consumed by the cleanup scheduler.
+    pub(crate) broadcast_cleanup: Option<piece_text_cleanup::BroadcastCleanupFn>,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +373,12 @@ pub(crate) async fn get_or_create_space(
     arc
 }
 
+// Used by the async PieceText cleanup task to re-acquire a loaded space after
+// its scheduling delay (see `db/piece_text_cleanup.rs`).
+pub(crate) async fn try_get_loaded_space(space_id: SpaceId) -> Option<Arc<Mutex<SpaceState>>> {
+    SPACES.lock().await.get(&space_id).cloned()
+}
+
 /// Log how spaces will be initialized at startup.
 ///
 /// `--schema` is a lazy global template applied to new spaces on first connection.
@@ -547,6 +568,8 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
+            cleanup_state: piece_text_cleanup::CleanupState::default(),
+            broadcast_cleanup: None,
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {
@@ -698,53 +721,72 @@ impl SpaceState {
         Ok(rows_by_table.into_values().next().unwrap_or_default())
     }
 
-    /// Reject a schema bundle if it contains `_lists` rows or any row data for
-    /// tables with List columns. Full list-aware schema bootstrap is a follow-up plan.
-    fn reject_schema_bundle_with_list_data(
+    /// Reject a schema bundle if it contains row data whose managed backing
+    /// state the direct bootstrap insert path cannot allocate: rows for the
+    /// `_lists`/`_piecetext_pieces`/`_piecetext_buffers` internal tables, or rows for any
+    /// table with `List` or `PieceText` columns.
+    ///
+    /// The bootstrap path inserts via `Db::insert` (the direct storage path),
+    /// which only allocates `List` metadata for internal tables and does NOT
+    /// run `InsertOp`'s managed-column allocation. Seeding a managed column
+    /// this way would leave dangling/unallocated backing state — e.g. a
+    /// `PieceText` cell stuck at placeholder `0`, which the SDK then rejects as
+    /// "not allocated". Full managed-column schema bootstrap is a follow-up
+    /// plan; until then we fail closed.
+    fn reject_schema_bundle_with_unsupported_data(
         &self,
         tables: &[SchemaTable],
     ) -> Result<(), ServerError> {
         use std::collections::HashSet;
 
-        // First pass: collect all table names that have List columns.
-        // Check both bundle-provided schemas AND existing server schemas
-        // to prevent bypass via a spoofed non-list schema in the bundle.
-        let mut tables_with_list_cols: HashSet<String> = HashSet::new();
+        // First pass: collect all table names that have managed (List or
+        // PieceText) columns. Check both bundle-provided schemas AND existing
+        // server schemas to prevent bypass via a spoofed plain schema in the
+        // bundle.
+        let has_managed_column = |schema: &encrypted_spaces_backend::schema::Schema| {
+            schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.column_type, ColumnType::List | ColumnType::PieceText))
+        };
+        let mut tables_with_managed_cols: HashSet<String> = HashSet::new();
         for bundle in tables {
             if let Some(ref schema) = bundle.schema {
-                let has_list_columns = schema
-                    .columns
-                    .iter()
-                    .any(|c| matches!(c.column_type, ColumnType::List));
-                if has_list_columns {
-                    tables_with_list_cols.insert(bundle.table.clone());
+                if has_managed_column(schema) {
+                    tables_with_managed_cols.insert(bundle.table.clone());
                 }
             }
             if !bundle.rows.is_empty() {
                 if let Ok(schema) = self.db.get_schema(&bundle.table) {
-                    let has_list_columns = schema
-                        .columns
-                        .iter()
-                        .any(|c| matches!(c.column_type, ColumnType::List));
-                    if has_list_columns {
-                        tables_with_list_cols.insert(bundle.table.clone());
+                    if has_managed_column(&schema) {
+                        tables_with_managed_cols.insert(bundle.table.clone());
                     }
                 }
             }
         }
 
-        // Second pass: reject any entry with rows for tables that have List columns
-        // or for the `_lists` internal table.
+        // Second pass: reject any entry with rows for a managed internal table
+        // or for a table that has managed columns.
         for bundle in tables {
-            if bundle.table == LISTS_TABLE_NAME && !bundle.rows.is_empty() {
-                return Err(ServerError::Generic(
-                    "schema bundle rejected: bundle contains _lists rows; list data bootstrap is not yet supported".to_string(),
-                ));
+            if bundle.rows.is_empty() {
+                continue;
             }
 
-            if tables_with_list_cols.contains(&bundle.table) && !bundle.rows.is_empty() {
+            if bundle.table == LISTS_TABLE_NAME
+                || bundle.table == PIECE_COORDS_TABLE_NAME
+                || bundle.table == BUFFERS_TABLE_NAME
+            {
                 return Err(ServerError::Generic(format!(
-                    "schema bundle rejected: table '{}' has List columns; list data bootstrap is not yet supported",
+                    "schema bundle rejected: bundle contains '{}' rows; managed-column \
+                     data bootstrap is not yet supported",
+                    bundle.table
+                )));
+            }
+
+            if tables_with_managed_cols.contains(&bundle.table) {
+                return Err(ServerError::Generic(format!(
+                    "schema bundle rejected: table '{}' has List/PieceText columns; \
+                     managed-column data bootstrap is not yet supported",
                     bundle.table
                 )));
             }
@@ -796,8 +838,9 @@ impl SpaceState {
         tables: Vec<SchemaTable>,
         auth_context: &AuthContext,
     ) -> Result<(), ServerError> {
-        // Fail-closed guard: reject bundles with list data.
-        self.reject_schema_bundle_with_list_data(&tables)?;
+        // Fail-closed guard: reject bundles with managed-column (List /
+        // PieceText) data the direct insert path cannot allocate.
+        self.reject_schema_bundle_with_unsupported_data(&tables)?;
 
         for bundle in tables {
             let SchemaTable {
@@ -970,6 +1013,7 @@ impl SpaceState {
         // Drop the per-user sigref view alongside the changelog; the next
         // signed change is the first in a fresh chain (sig_ref == 0).
         self.sigref_map.clear();
+        self.cleanup_state.clear_pending();
         Ok(())
     }
 
@@ -1211,6 +1255,29 @@ impl SpaceState {
         let tree_path = &change.message.tree_path;
 
         match change.message.op_type {
+            OpType::PieceTextEdit => {
+                // The signed manifest fully describes the edit. Decoding it
+                // validates the entry shape (single `PT`-tagged entry whose key
+                // matches the envelope address/op_id, canonical bytes, and size
+                // caps); the op verifier authenticates it against tree state.
+                PieceTextEditEnvelopeV1::decode_from_entry(change)
+                    .map(|_| ())
+                    .map_err(|e| ServerError::Generic(format!("Invalid PieceTextEdit change: {e}")))
+            }
+            OpType::PieceTextCleanupPieces => {
+                PieceTextCleanupPiecesEnvelopeV1::decode_from_entry(change)
+                    .map(|_| ())
+                    .map_err(|e| {
+                        ServerError::Generic(format!("Invalid PieceTextCleanupPieces change: {e}"))
+                    })
+            }
+            OpType::PieceTextCleanupBuffers => {
+                PieceTextCleanupBuffersEnvelopeV1::decode_from_entry(change)
+                    .map(|_| ())
+                    .map_err(|e| {
+                        ServerError::Generic(format!("Invalid PieceTextCleanupBuffers change: {e}"))
+                    })
+            }
             OpType::ListAppend | OpType::ListInsert | OpType::ListUpdate | OpType::ListDelete => {
                 if tree_path.as_slice() != b"/" {
                     return Err(ServerError::Generic(format!(
@@ -1687,6 +1754,22 @@ impl SpaceState {
                     "Noop changes are only supported by the FF prover benchmark".to_string(),
                 ));
             }
+            OpType::PieceTextEdit => {
+                // Signed user-source piece-table edit. The op verifier
+                // (`PieceTextEditOp`) authenticates the envelope against tree
+                // state and materialises the `_piecetext_pieces` / `_piecetext_buffers`
+                // writes; the generic `apply_change_with_pruned_tree` call below
+                // runs it. The inserted buffer ciphertexts travelled in
+                // `values_sidecar` and were validated + stored as hash-backed
+                // values by `handle_change`, so there is no PieceText-specific
+                // server validation to do here. Fall through to the shared
+                // apply path.
+            }
+            OpType::PieceTextCleanupPieces | OpType::PieceTextCleanupBuffers => {
+                return Err(ServerError::Generic(
+                    "PieceText cleanup is emitted by the server cleanup queue".to_string(),
+                ));
+            }
             OpType::Insert | OpType::Update | OpType::Delete => {
                 let entry_table = first_table_in_change(entry).ok_or_else(|| {
                     ServerError::Generic(format!(
@@ -1889,6 +1972,23 @@ impl SpaceState {
         use encrypted_spaces_storage_encoding::HASH_LEN;
 
         let op = change.entry.message.op_type;
+
+        // PieceTextEdit carries its hash-backed values (inserted buffer
+        // ciphertexts) named by `ciphertext_value_hash` in the signed manifest,
+        // not as hash-backed column cells in `entries`. Collect the referenced
+        // set from the manifest, requiring every referenced body to be supplied
+        // in this change's sidecar, to hash to the manifest value, and to be a
+        // usable stored ciphertext — so the direct `handle_change` path cannot
+        // commit a `_piecetext_buffers.contents` hash with no/incorrect/garbage material.
+        // Requiring the material in the sidecar (rather than resolving it from
+        // the store) also keeps the response echo — `change.hashed_values`,
+        // returned by `collect_hashed_values_for_change` below — complete for
+        // broadcast. Combined with `validate_hashed_values_references`, this also
+        // rejects any sidecar value the manifest does not name.
+        if op == OpType::PieceTextEdit {
+            return piece_text_edit::referenced_buffer_hashes(&change.entry, &change.hashed_values);
+        }
+
         let is_delete_only = matches!(op, OpType::Delete | OpType::RemoveUser | OpType::ListDelete);
         let mut referenced_hashes = BTreeSet::new();
 
@@ -1979,6 +2079,18 @@ impl SpaceState {
 
     fn collect_hashed_values_for_change(&self, change: &Change) -> HashedValues {
         use encrypted_spaces_storage_encoding::HASH_LEN;
+
+        // PieceTextEdit's hash-backed values are the inserted buffer bodies,
+        // which are named by hash in the manifest rather than stored in
+        // hash-backed column cells. Echo them straight back so broadcast
+        // recipients receive the inserted ciphertexts. This is complete because
+        // `require_hashed_values_for_change` requires every manifest-referenced
+        // body to be supplied in `change.hashed_values` (no silent resolution
+        // from the store) and `validate_hashed_values_references` rejects any
+        // extra — so `change.hashed_values` is exactly the referenced material.
+        if change.entry.message.op_type == OpType::PieceTextEdit {
+            return change.hashed_values.clone();
+        }
 
         let mut result = HashedValues::new();
 
@@ -2075,6 +2187,14 @@ impl SpaceState {
         auth: &AuthContext,
     ) -> Result<ChangeResponse, ServerError> {
         let entry = &change.entry;
+        if matches!(
+            entry.message.op_type,
+            OpType::PieceTextCleanupPieces | OpType::PieceTextCleanupBuffers
+        ) {
+            return Err(ServerError::Generic(
+                "PieceText cleanup is emitted by the server cleanup queue".to_string(),
+            ));
+        }
         if auth.uid.is_none() {
             return Err(ServerError::Generic("Missing user's UID".to_string()));
         }
@@ -2209,6 +2329,59 @@ impl SpaceState {
             hashed_values: response_hashed_values,
         };
         self.change_responses.push(response.clone());
+
+        // Post-commit self-check: re-derive the edited document and assert its
+        // `_piecetext_pieces` / `_piecetext_buffers` structure is internally consistent. The
+        // signed verifier already enforced these properties; this is a
+        // defence-in-depth scan that runs only in debug builds and is log-only
+        // (a violation here, after the change is committed, must not wedge the
+        // request worker — it is recorded for investigation).
+        #[cfg(debug_assertions)]
+        if entry.message.op_type == OpType::PieceTextEdit {
+            if let Ok(envelope) = PieceTextEditEnvelopeV1::decode_from_entry(entry) {
+                if let Err(e) = self.assert_piece_text_invariants(&envelope.address) {
+                    log::error!(
+                        "space={} piece-text invariants violated post-edit \
+                         (table={}, row_id={}, column={}, change_id={change_id}): {e}",
+                        self.space_id,
+                        envelope.address.table,
+                        envelope.address.row_id,
+                        envelope.address.column,
+                    );
+                }
+            }
+        }
+
+        if entry.message.op_type == OpType::PieceTextEdit && self.cleanup_state.auto_cleanup_enabled
+        {
+            if let Ok(envelope) = PieceTextEditEnvelopeV1::decode_from_entry(entry) {
+                match self
+                    .read_piece_text_list_number_for_cleanup(&envelope.address)
+                    .and_then(|list_number| {
+                        self.count_tombstone_rows_for_list(list_number)
+                            .map(|count| (list_number, count))
+                    }) {
+                    Ok((list_number, tombstones)) => {
+                        self.maybe_schedule_piece_text_cleanup(
+                            envelope.address.clone(),
+                            list_number,
+                            tombstones,
+                        );
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "space={} piece-text cleanup bookkeeping after edit failed \
+                             (non-fatal, table={}, row_id={}, column={}, change_id={}): {e}",
+                            self.space_id,
+                            envelope.address.table,
+                            envelope.address.row_id,
+                            envelope.address.column,
+                            change_id,
+                        );
+                    }
+                }
+            }
+        }
 
         self.maybe_generate_ff_proof()?;
 
@@ -3032,6 +3205,9 @@ fn rows_affected(change: &ChangelogEntry) -> u64 {
         | OpType::Reduce
         | OpType::Rekey => 1,
         OpType::ListAppend | OpType::ListInsert | OpType::ListUpdate | OpType::ListDelete => 1,
+        OpType::PieceTextEdit
+        | OpType::PieceTextCleanupPieces
+        | OpType::PieceTextCleanupBuffers => 1,
         OpType::Noop => 0,
         OpType::Action => {
             // Same shape as Update/Delete: count unique column-key row_ids.
@@ -3222,9 +3398,31 @@ async fn handle_change(
     };
 
     let retention_proofs = req.retention_proofs;
+    // PieceTextEdit carries its inserted buffer ciphertexts in `values_sidecar`
+    // as an ordered list (1:1 with the manifest's Insert ops). Materialise them
+    // into hash-store values keyed by the manifest's `ciphertext_value_hash`
+    // (see db/piece_text_edit.rs and the Commit 3 sidecar spike notes). Every
+    // other op uses the generic re-hash-by-content path.
+    //
+    // Client contract (Commit 4 SDK): a PieceTextEdit `ChangeRequest` must place
+    // the *raw* inserted ciphertext bytes into `values_sidecar` in manifest-Insert
+    // order — not the generic `Change.hashed_values` map serialisation, whose
+    // values are wrapped stored-forms in unspecified order. Mismatched input
+    // fails loudly here (`inserted_body_values` re-checks count, length, key-id,
+    // and the manifest hash) rather than committing inconsistent state. The core
+    // `handle_change` path enforces material presence/binding independently, so a
+    // direct caller that skips this materialisation is still rejected.
+    let hashed_values = if changelog_entry.message.op_type == OpType::PieceTextEdit {
+        match piece_text_edit::inserted_body_values(&changelog_entry, &req.values_sidecar) {
+            Ok(hashed_values) => hashed_values,
+            Err(e) => return error_response(request_id, &e.to_string()),
+        }
+    } else {
+        proto::values_sidecar_from_proto(req.values_sidecar)
+    };
     let change = Change {
         entry: changelog_entry,
-        hashed_values: proto::values_sidecar_from_proto(req.values_sidecar),
+        hashed_values,
     };
 
     match get_or_create_space(auth_context.space_id, Some(app_cfg))
@@ -4216,6 +4414,62 @@ mod tests {
             .expect("known internal table must import cleanly");
     }
 
+    #[tokio::test]
+    async fn apply_schema_bundle_rejects_piece_text_data() {
+        // The direct bootstrap insert path does not run InsertOp's PieceText
+        // allocation, so seeding a PieceText column would leave the cell at
+        // placeholder 0 (which the SDK later rejects as "not allocated"). The
+        // guard must fail closed rather than store an unallocated cell.
+        let state = SpaceState::init_server(
+            None,
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let schema = Schema {
+            name: "docs".to_string(),
+            columns: vec![
+                encrypted_spaces_backend::schema::ColumnDefinition {
+                    name: "id".to_string(),
+                    column_type: encrypted_spaces_backend::schema::ColumnType::Integer,
+                    plaintext: true,
+                    indexed: false,
+                },
+                encrypted_spaces_backend::schema::ColumnDefinition {
+                    name: "body".to_string(),
+                    column_type: encrypted_spaces_backend::schema::ColumnType::PieceText,
+                    plaintext: false,
+                    indexed: false,
+                },
+            ],
+            auto_increment: true,
+        };
+        let tables = vec![SchemaTable {
+            table: "docs".to_string(),
+            schema: Some(schema),
+            rows: vec![serde_json::json!({ "id": 1, "body": 0 })],
+        }];
+
+        let auth_context = AuthContext::new(None, state.space_id);
+        let err = state
+            .apply_schema_bundle(tables, &auth_context)
+            .await
+            .expect_err("expected PieceText bootstrap rejection");
+        let msg = match err {
+            ServerError::Generic(m) => m,
+            other => panic!("expected ServerError::Generic, got {other:?}"),
+        };
+        assert!(msg.contains("PieceText"), "msg={msg}");
+        assert!(msg.contains("docs"), "msg={msg}");
+    }
+
     /// Tauri demo config (app_schema.kdl). Run with:
     ///   cargo test -p encrypted-spaces-backend-server print_demo_commitment -- --nocapture
     #[ignore]
@@ -5042,6 +5296,503 @@ mod tests {
         assert!(
             err_msg.contains("missing hashed value") || err_msg.contains("expected 32"),
             "error should mention missing hashed value, got: {err_msg}"
+        );
+    }
+
+    // --- Commit 3: PieceTextEdit through the generic change path ---
+
+    use encrypted_spaces_backend::internal_schemas::BUFFERS_TABLE_NAME;
+    use encrypted_spaces_changelog_core::piece_text::{
+        BufferCoord, InsertedBufferManifest, PieceTextAddress, PieceTextEditEnvelopeV1,
+        PieceTextEditItemManifest, PieceTextEditManifest, PIECE_TEXT_ENVELOPE_VERSION_V1,
+    };
+    use encrypted_spaces_crypto::encryption::{encrypt_field, EncryptionKey};
+
+    /// Stand up a space with a `docs` table carrying a PieceText `body` column,
+    /// register a full user, and insert one parent row (row_id 1) so a
+    /// PieceTextEdit has a document to edit.
+    async fn piece_text_edit_test_state() -> (
+        SpaceState,
+        AuthContext,
+        SignatureKeyPair<Ed25519Signature>,
+        PieceTextAddress,
+    ) {
+        let schema = Schema {
+            name: "docs".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Integer,
+                    plaintext: true,
+                    indexed: false,
+                },
+                ColumnDefinition {
+                    name: "body".to_string(),
+                    column_type: ColumnType::PieceText,
+                    plaintext: true,
+                    indexed: false,
+                },
+                ColumnDefinition {
+                    name: "title".to_string(),
+                    column_type: ColumnType::String,
+                    plaintext: true,
+                    indexed: false,
+                },
+            ],
+            auto_increment: true,
+        };
+
+        let mut state = SpaceState::init_server(
+            Some(&vec![schema]),
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let key_pair = SignatureKeyPair::<Ed25519Signature>::new();
+        let encoded_auth_key = encode_auth_key(&key_pair);
+        let auth = AuthContext::new(None, state.space_id);
+        let uid = state
+            .db
+            .insert(
+                Query::new(
+                    USERS_TABLE_NAME.to_string(),
+                    QueryOperation::Insert(vec![
+                        ("update_key".to_string(), QueryParam::Text(String::new())),
+                        ("auth_key".to_string(), QueryParam::Text(encoded_auth_key)),
+                        ("status".to_string(), QueryParam::Integer(1)),
+                    ]),
+                ),
+                &auth,
+            )
+            .await
+            .unwrap();
+        let uid = u32::try_from(uid).unwrap();
+        let auth = AuthContext::new(Some(uid as i64), state.space_id);
+
+        let body_key = column_key_placeholder("docs", "body");
+        let title_key = column_key_placeholder("docs", "title");
+        let body_value = stored_value::value_to_bytes(&serde_json::json!(0)).unwrap();
+        let title_value = stored_value::value_to_bytes(&serde_json::json!("seed title")).unwrap();
+        let mut insert_change = Change::new(
+            OpType::Insert,
+            uid,
+            ROOT_TREE_PATH,
+            &[body_key.as_slice(), title_key.as_slice()],
+            &[body_value.as_slice(), title_value.as_slice()],
+            state.changelog.num_changes(),
+            0,
+            state.changelog.current_root(),
+        )
+        .unwrap();
+        insert_change.entry.signature = key_pair
+            .sign(&insert_change.entry.as_bytes())
+            .as_ref()
+            .to_vec();
+        state.handle_change(&insert_change, &auth).await.unwrap();
+
+        let address = PieceTextAddress {
+            table: "docs".to_string(),
+            row_id: 1,
+            column: "body".to_string(),
+        };
+        (state, auth, key_pair, address)
+    }
+
+    /// Encrypt "abc" (UTF-32LE, 12 bytes) and return `(raw_ciphertext, stored_form,
+    /// stored_hash)` where `stored_form` is the on-merk hash-backed value and
+    /// `stored_hash` is the manifest's `ciphertext_value_hash`.
+    fn sample_inserted_body() -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+        let encryption_key = EncryptionKey::new([7u8; 32], &SimpleKeyId(0));
+        let cleartext: Vec<u8> = "abc"
+            .chars()
+            .flat_map(|c| (c as u32).to_le_bytes())
+            .collect();
+        let body = encrypt_field(&cleartext, &encryption_key);
+        let stored = stored_value::value_to_bytes(&serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD.encode(&body),
+        ))
+        .unwrap();
+        let stored_hash = encrypted_spaces_storage_encoding::hashstore_hash(&stored);
+        (body, stored, stored_hash)
+    }
+
+    fn signed_piece_text_edit_entry(
+        state: &SpaceState,
+        key_pair: &SignatureKeyPair<Ed25519Signature>,
+        auth: &AuthContext,
+        envelope: &PieceTextEditEnvelopeV1,
+    ) -> ChangelogEntry {
+        let mut entry = ChangelogEntry {
+            timestamp: ChangelogEntry::get_unix_timestamp(),
+            uid: auth.uid.unwrap() as u32,
+            parent_change: state.changelog.num_changes(),
+            message: envelope.changelog_message().unwrap(),
+            sig_ref: state.changelog.num_changes(),
+            parent_clc: state.changelog.current_root(),
+            signature: vec![],
+        };
+        entry.signature = key_pair.sign(&entry.as_bytes()).as_ref().to_vec();
+        entry
+    }
+
+    /// Happy path: a signed PieceTextEdit submitted with its inserted body in
+    /// `values_sidecar` is applied through the generic `handle_change` pipeline.
+    /// The buffer ciphertext is stored as a hash-backed value and `_piecetext_buffers`
+    /// holds its hash; the document's structural invariants hold.
+    #[tokio::test]
+    async fn piece_text_edit_via_generic_sidecar_inserts_buffer() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, stored, stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address: address.clone(),
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        // Mirror the server transport: `values_sidecar` carries the raw inserted
+        // body, materialised into hash-store values keyed by the manifest hash.
+        let hashed_values =
+            piece_text_edit::inserted_body_values(&entry, std::slice::from_ref(&body)).unwrap();
+        let change = Change {
+            entry,
+            hashed_values,
+        };
+        let response = state.handle_change(&change, &auth).await.unwrap();
+
+        assert_eq!(response.rows_affected, 1);
+        // The inserted body is echoed (for broadcast) and persisted in the store.
+        assert_eq!(response.hashed_values.get(&stored_hash), Some(&stored));
+        assert_eq!(state.hash_store.get(&stored_hash), Some(&stored));
+        // `_piecetext_buffers.contents` holds the hash, exactly like any hash-backed column.
+        assert_eq!(
+            state
+                .db
+                .get_value(&column_key(BUFFERS_TABLE_NAME, 1, "contents"))
+                .unwrap()
+                .unwrap(),
+            stored_hash.to_vec()
+        );
+
+        let report = state.assert_piece_text_invariants(&address).unwrap();
+        assert_eq!(report.piece_count, 1);
+        assert_eq!(report.live_piece_count, 1);
+        assert_eq!(report.tombstone_piece_count, 0);
+        assert_eq!(report.buffer_count, 1);
+    }
+
+    /// A sidecar value the signed manifest does not name is rejected: the
+    /// generic reference check (`validate_hashed_values_references`) only
+    /// accepts the manifest's `ciphertext_value_hash` set.
+    #[tokio::test]
+    async fn piece_text_edit_rejects_unreferenced_sidecar_value() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, _stored, stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        let mut hashed_values =
+            piece_text_edit::inserted_body_values(&entry, std::slice::from_ref(&body)).unwrap();
+        // Stuff in an extra value the manifest never references.
+        let extra = b"unreferenced ciphertext".to_vec();
+        hashed_values.insert(
+            encrypted_spaces_storage_encoding::hashstore_hash(&extra),
+            extra,
+        );
+        let change = Change {
+            entry,
+            hashed_values,
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unreferenced hashed value"),
+            "expected unreferenced-value rejection, got: {err}"
+        );
+    }
+
+    /// An inserted body that does not hash to the manifest's claimed
+    /// `ciphertext_value_hash` is rejected during sidecar materialisation, so a
+    /// signer cannot bind a buffer hash to mismatched bytes.
+    #[tokio::test]
+    async fn piece_text_edit_rejects_body_hash_mismatch() {
+        let (state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, _stored, _stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        // Wrong hash: not derived from `body`.
+                        ciphertext_value_hash: [0xab; 32],
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        let err = piece_text_edit::inserted_body_values(&entry, &[body]).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match manifest"),
+            "expected manifest-hash mismatch, got: {err}"
+        );
+    }
+
+    /// A direct `handle_change` caller (e.g. `LocalTransport`) that omits the
+    /// inserted buffer material entirely is rejected before apply, so a
+    /// `_piecetext_buffers.contents` hash can never be committed with nothing backing it.
+    #[tokio::test]
+    async fn piece_text_edit_rejects_missing_buffer_material() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, _stored, stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        // Empty sidecar: the manifest references `stored_hash` but no material
+        // is supplied.
+        let change = Change {
+            entry,
+            hashed_values: HashedValues::new(),
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no material supplied in the sidecar"),
+            "expected missing-material rejection, got: {err}"
+        );
+    }
+
+    /// Even when the inserted buffer material already exists in the server's
+    /// `hash_store`, a PieceTextEdit that omits it from the sidecar is rejected.
+    /// A new `_piecetext_buffers.contents` reference must carry its material in this
+    /// change so the `ChangeResponse`/broadcast echoes it to peers; silently
+    /// resolving from the store would apply an edit whose broadcast omits the
+    /// material. (This is the store-backed regression case.)
+    #[tokio::test]
+    async fn piece_text_edit_requires_sidecar_material_even_if_already_stored() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, stored, stored_hash) = sample_inserted_body();
+
+        // Seed the store with the material, as if a prior change had stored it.
+        let mut seed = HashedValues::new();
+        seed.insert(stored_hash, stored);
+        state.insert_hashed_values(&seed);
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        // Empty sidecar: material is in the store but not supplied here.
+        let change = Change {
+            entry,
+            hashed_values: HashedValues::new(),
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no material supplied in the sidecar"),
+            "expected sidecar-required rejection even with stored material, got: {err}"
+        );
+    }
+
+    /// A direct caller that supplies material under the right manifest hash key
+    /// but with bytes that do not hash to it is rejected: the resolved value
+    /// must genuinely match the signed manifest's `ciphertext_value_hash`.
+    #[tokio::test]
+    async fn piece_text_edit_rejects_buffer_material_hash_mismatch() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, _stored, stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: body.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        // Right key, wrong bytes: the value stored under `stored_hash` does not
+        // hash to `stored_hash`.
+        let mut hashed_values = HashedValues::new();
+        hashed_values.insert(stored_hash, b"not the committed stored form".to_vec());
+        let change = Change {
+            entry,
+            hashed_values,
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not match manifest hash"),
+            "expected material-binding rejection, got: {err}"
+        );
+    }
+
+    /// A signer who commits `hashstore_hash(garbage)` and supplies that exact
+    /// garbage passes presence + binding, but the bytes are not a usable stored
+    /// ciphertext. Here the wrapped ciphertext has a corrupted key-id header, so
+    /// the direct path must still reject it (binding does not imply validity —
+    /// the signer chose the hash).
+    #[tokio::test]
+    async fn piece_text_edit_rejects_invalid_stored_ciphertext_material() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, _stored, _stored_hash) = sample_inserted_body();
+
+        // Corrupt the ciphertext version byte so its key-id header is invalid,
+        // but wrap it into a well-formed stored value and commit to that hash.
+        let mut corrupted = body.clone();
+        corrupted[0] ^= 0xff;
+        let stored = stored_value::value_to_bytes(&serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD.encode(&corrupted),
+        ))
+        .unwrap();
+        let stored_hash = encrypted_spaces_storage_encoding::hashstore_hash(&stored);
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        ciphertext_len: corrupted.len() as u32,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        let mut hashed_values = HashedValues::new();
+        hashed_values.insert(stored_hash, stored);
+        let change = Change {
+            entry,
+            hashed_values,
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid key-id header"),
+            "expected invalid-ciphertext rejection, got: {err}"
+        );
+    }
+
+    /// Material that is a valid stored ciphertext but whose raw length does not
+    /// match the manifest's `ciphertext_len` is rejected, binding the on-merk
+    /// buffer to the length the signer committed to.
+    #[tokio::test]
+    async fn piece_text_edit_rejects_ciphertext_len_mismatch() {
+        let (mut state, auth, key_pair, address) = piece_text_edit_test_state().await;
+        let (body, stored, stored_hash) = sample_inserted_body();
+
+        let envelope = PieceTextEditEnvelopeV1 {
+            version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+            op_id: [9u8; 16],
+            address,
+            edit: PieceTextEditManifest {
+                ops: vec![PieceTextEditItemManifest::Insert {
+                    at: BufferCoord::DOCUMENT_START,
+                    inserted: InsertedBufferManifest {
+                        len_bytes: 12,
+                        // Claim a different ciphertext length than the real body.
+                        ciphertext_len: body.len() as u32 + 4,
+                        ciphertext_value_hash: stored_hash,
+                    },
+                }],
+            },
+        };
+        let entry = signed_piece_text_edit_entry(&state, &key_pair, &auth, &envelope);
+
+        let mut hashed_values = HashedValues::new();
+        hashed_values.insert(stored_hash, stored);
+        let change = Change {
+            entry,
+            hashed_values,
+        };
+
+        let err = state.handle_change(&change, &auth).await.unwrap_err();
+        assert!(
+            err.to_string().contains("manifest claims"),
+            "expected ciphertext-length rejection, got: {err}"
         );
     }
 }

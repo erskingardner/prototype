@@ -9,7 +9,7 @@ import {
   type ReactNode,
   type Dispatch,
 } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listenSafely } from "@/lib/tauri-events";
 import type {
   UserInfo,
   Channel,
@@ -144,18 +144,18 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const listeners = [
-      listen("zoom_in", () => {
+      listenSafely("zoom_in", () => {
         dispatch({ type: "setFontScale", scale: Math.min(200, fontScaleRef.current + 10) });
       }),
-      listen("zoom_out", () => {
+      listenSafely("zoom_out", () => {
         dispatch({ type: "setFontScale", scale: Math.max(50, fontScaleRef.current - 10) });
       }),
-      listen("zoom_reset", () => {
+      listenSafely("zoom_reset", () => {
         dispatch({ type: "setFontScale", scale: 100 });
       }),
     ];
     return () => {
-      listeners.forEach((p) => p.then((fn) => fn()));
+      listeners.forEach((cleanup) => cleanup());
     };
   }, []);
 
@@ -163,7 +163,7 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!state.initialized || !state.currentChannelId) return;
 
-    const unlisten = listen("space-updated", async () => {
+    return listenSafely("space-updated", async () => {
       console.debug("[store] space-updated received, fetching all data");
       try {
         // Use allSettled so transient proof failures (during multi-step
@@ -173,18 +173,13 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
           api.getMessages(state.currentChannelId!),
           api.getReactions(state.currentChannelId!),
           api.getTasks(),
-          api.getNotes(),
           api.getCalendarEvents(),
         ]);
-        const [channels, messages, reactions, tasks, notesText, calendarEvents] = results;
+        const [channels, messages, reactions, tasks, calendarEvents] = results;
         if (channels.status === "fulfilled") dispatch({ type: "setChannels", channels: channels.value });
         if (messages.status === "fulfilled") dispatch({ type: "setMessages", messages: messages.value });
         if (reactions.status === "fulfilled") dispatch({ type: "setReactions", reactions: reactions.value });
         if (tasks.status === "fulfilled") dispatch({ type: "setTasks", tasks: tasks.value });
-        if (notesText.status === "fulfilled") {
-          console.debug("[store] space-updated: notesText_len=%d", notesText.value.length);
-          dispatch({ type: "setNotesText", notesText: notesText.value });
-        }
         if (calendarEvents.status === "fulfilled") dispatch({ type: "setCalendarEvents", events: calendarEvents.value });
 
         // Fetch message counts for non-current channels
@@ -226,10 +221,6 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
         log.error("Failed to refresh after broadcast:", e);
       }
     });
-
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   }, [state.initialized, state.currentChannelId]);
 
   return (

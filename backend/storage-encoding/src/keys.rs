@@ -12,6 +12,9 @@
 //! | Schema   | `("S", table)` |
 //! | Row      | `("R", table, row_id)` |
 //! | Index    | `("I", table, column, value, row_id)` |
+//! | PieceTextEdit | `("PT", table, row_id, column, op_id)` |
+//! | PieceTextCleanupPieces | `("PTCP", table, row_id, column, op_id)` |
+//! | PieceTextCleanupBuffers | `("PTCB", table, row_id, column, op_id)` |
 //!
 //! This design ensures:
 //! - Keys of different types are naturally separated
@@ -121,6 +124,15 @@ const TAG_INDEX: &str = "I";
 /// format tokens, not stored in authenticated state.
 const TAG_MARKER: &str = "M";
 
+/// Key type tag for piece-text edit changelog entries.
+pub const TAG_PIECE_TEXT: &str = "PT";
+
+/// Key type tag for piece-text piece-cleanup changelog entries.
+pub const TAG_PIECE_TEXT_CLEANUP_PIECES: &str = "PTCP";
+
+/// Key type tag for piece-text buffer-cleanup changelog entries.
+pub const TAG_PIECE_TEXT_CLEANUP_BUFFERS: &str = "PTCB";
+
 /// On-wire format version for the action storage value.
 ///
 /// The stored bytes are `[ACTION_STORAGE_VERSION, postcard(ActionBody)...]`.
@@ -140,6 +152,12 @@ pub const RETENTION_TABLE: &str = "_retention";
 
 /// The table name for the lists system table.
 pub const LISTS_TABLE: &str = "_lists";
+
+/// The table name for the piece-coordinate system table.
+pub const PIECE_COORDS_TABLE: &str = "_piecetext_pieces";
+
+/// The table name for the encrypted piece-text buffers system table.
+pub const BUFFERS_TABLE: &str = "_piecetext_buffers";
 
 /// Error type for key encoding/decoding operations.
 #[derive(Debug, Clone)]
@@ -204,6 +222,16 @@ pub fn schema_list_columns_key(table: &str) -> Vec<u8> {
     encode_tuple(&[TAG_SCHEMA.into(), table.into(), "list_columns".into()])
 }
 
+/// Build a key for storing the compact piece-text-column-names list for a table.
+///
+/// Format: `tuple("S", table, "piece_text_columns")`
+///
+/// The value is a null-separated UTF-8 string of column names that have
+/// `ColumnType::PieceText`, e.g. `"notes_pieces"`.
+pub fn schema_piece_text_columns_key(table: &str) -> Vec<u8> {
+    encode_tuple(&[TAG_SCHEMA.into(), table.into(), "piece_text_columns".into()])
+}
+
 /// Build a key for storing the next auto-assigned row ID for a table.
 ///
 /// Format: `tuple("S", table, "next_id")`
@@ -248,6 +276,17 @@ pub fn schema_next_list_number_key() -> Vec<u8> {
     ])
 }
 
+/// Build a key for storing the next piece-text list-number counter.
+///
+/// Format: `tuple("S", "_piecetext_pieces", "next_list_number")`.
+pub fn piece_coords_next_list_number_key() -> Vec<u8> {
+    encode_tuple(&[
+        TAG_SCHEMA.into(),
+        PIECE_COORDS_TABLE.into(),
+        "next_list_number".into(),
+    ])
+}
+
 /// Build a key for storing the head pointer of a specific list.
 ///
 /// Format: `tuple("S", "_lists", "head", list_number)`
@@ -260,6 +299,18 @@ pub fn list_head_key(list_number: i64) -> Vec<u8> {
     encode_tuple(&[
         TAG_SCHEMA.into(),
         LISTS_TABLE.into(),
+        "head".into(),
+        list_number.into(),
+    ])
+}
+
+/// Build a key for storing the head pointer of a specific piece-coordinate list.
+///
+/// Format: `tuple("S", "_piecetext_pieces", "head", list_number)`.
+pub fn piece_coords_head_key(list_number: i64) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_SCHEMA.into(),
+        PIECE_COORDS_TABLE.into(),
         "head".into(),
         list_number.into(),
     ])
@@ -282,12 +333,35 @@ pub fn list_tail_key(list_number: i64) -> Vec<u8> {
     ])
 }
 
+/// Build a key for storing the tail pointer of a specific piece-coordinate list.
+///
+/// Format: `tuple("S", "_piecetext_pieces", "tail", list_number)`.
+pub fn piece_coords_tail_key(list_number: i64) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_SCHEMA.into(),
+        PIECE_COORDS_TABLE.into(),
+        "tail".into(),
+        list_number.into(),
+    ])
+}
+
 /// `tuple("S", "_lists", "parent", list_number)` — value is the parent
 /// `(table, row_id, column)` triple encoded via `encode_list_parent`.
 pub fn list_parent_key(list_number: i64) -> Vec<u8> {
     encode_tuple(&[
         TAG_SCHEMA.into(),
         LISTS_TABLE.into(),
+        "parent".into(),
+        list_number.into(),
+    ])
+}
+
+/// `tuple("S", "_piecetext_pieces", "parent", list_number)` — value is the
+/// parent `(table, row_id, column)` triple encoded via `encode_list_parent`.
+pub fn piece_coords_parent_key(list_number: i64) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_SCHEMA.into(),
+        PIECE_COORDS_TABLE.into(),
         "parent".into(),
         list_number.into(),
     ])
@@ -352,6 +426,57 @@ pub fn column_key(table: &str, row_id: i64, column: &str) -> Vec<u8> {
 /// (table, column) components and ignoring the row_id.
 pub fn column_key_placeholder(table: &str, column: &str) -> Vec<u8> {
     column_key(table, 0, column)
+}
+
+/// Build the changelog-entry key for an atomic piece-text edit manifest.
+///
+/// Format: `tuple("PT", table, row_id, column, op_id)`
+pub fn piece_text_edit_key(table: &str, row_id: i64, column: &str, op_id: [u8; 16]) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_PIECE_TEXT.into(),
+        table.into(),
+        row_id.into(),
+        column.into(),
+        op_id.as_slice().into(),
+    ])
+}
+
+/// Build the changelog-entry key for a server-generated piece-text
+/// piece-cleanup manifest.
+///
+/// Format: `tuple("PTCP", table, row_id, column, op_id)`
+pub fn piece_text_cleanup_pieces_key(
+    table: &str,
+    row_id: i64,
+    column: &str,
+    op_id: i64,
+) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_PIECE_TEXT_CLEANUP_PIECES.into(),
+        table.into(),
+        row_id.into(),
+        column.into(),
+        op_id.into(),
+    ])
+}
+
+/// Build the changelog-entry key for a server-generated piece-text
+/// buffer-cleanup manifest.
+///
+/// Format: `tuple("PTCB", table, row_id, column, op_id)`
+pub fn piece_text_cleanup_buffers_key(
+    table: &str,
+    row_id: i64,
+    column: &str,
+    op_id: i64,
+) -> Vec<u8> {
+    encode_tuple(&[
+        TAG_PIECE_TEXT_CLEANUP_BUFFERS.into(),
+        table.into(),
+        row_id.into(),
+        column.into(),
+        op_id.into(),
+    ])
 }
 
 /// Build a key prefix for iterating all rows in a table.
@@ -597,6 +722,30 @@ pub enum ParsedKey {
     ActionMarker {
         primary_table: String,
     },
+    /// `tuple("PT", table, row_id, column, op_id)` — atomic piece-text
+    /// edit manifest changelog entry.
+    PieceTextEdit {
+        table: String,
+        row_id: i64,
+        column: String,
+        op_id: [u8; 16],
+    },
+    /// `tuple("PTCP", table, row_id, column, op_id)` — server-generated
+    /// piece-text piece-cleanup manifest changelog entry.
+    PieceTextCleanupPieces {
+        table: String,
+        row_id: i64,
+        column: String,
+        op_id: i64,
+    },
+    /// `tuple("PTCB", table, row_id, column, op_id)` — server-generated
+    /// piece-text buffer-cleanup manifest changelog entry.
+    PieceTextCleanupBuffers {
+        table: String,
+        row_id: i64,
+        column: String,
+        op_id: i64,
+    },
 }
 
 /// Borrowed view of an exact `tuple("R", table, row_id, column)` key.
@@ -632,6 +781,9 @@ pub fn parse_key(key: &[u8]) -> Result<ParsedKey, KeyError> {
         TAG_ROW => parse_row_elements(&elements),
         TAG_INDEX => parse_index_elements(&elements),
         TAG_MARKER => parse_marker_elements(&elements),
+        TAG_PIECE_TEXT => parse_piece_text_edit_elements(&elements),
+        TAG_PIECE_TEXT_CLEANUP_PIECES => parse_piece_text_cleanup_pieces_elements(&elements),
+        TAG_PIECE_TEXT_CLEANUP_BUFFERS => parse_piece_text_cleanup_buffers_elements(&elements),
         _ => Err(KeyError(format!("Unknown key type: {tag}"))),
     }
 }
@@ -874,6 +1026,73 @@ fn parse_index_elements(elements: &[TupleElement]) -> Result<ParsedKey, KeyError
     })
 }
 
+fn parse_piece_text_edit_elements(elements: &[TupleElement]) -> Result<ParsedKey, KeyError> {
+    if elements.len() != 5 {
+        return Err(KeyError(format!(
+            "PieceTextEdit key must have 5 elements, got {}",
+            elements.len()
+        )));
+    }
+
+    let table = element_to_string(&elements[1])?;
+    let row_id = element_to_int(&elements[2])?;
+    let column = element_to_string(&elements[3])?;
+    let op_id = element_to_16_byte_array(&elements[4])?;
+
+    Ok(ParsedKey::PieceTextEdit {
+        table,
+        row_id,
+        column,
+        op_id,
+    })
+}
+
+fn parse_piece_text_cleanup_pieces_elements(
+    elements: &[TupleElement],
+) -> Result<ParsedKey, KeyError> {
+    if elements.len() != 5 {
+        return Err(KeyError(format!(
+            "PieceTextCleanupPieces key must have 5 elements, got {}",
+            elements.len()
+        )));
+    }
+
+    let table = element_to_string(&elements[1])?;
+    let row_id = element_to_int(&elements[2])?;
+    let column = element_to_string(&elements[3])?;
+    let op_id = element_to_int(&elements[4])?;
+
+    Ok(ParsedKey::PieceTextCleanupPieces {
+        table,
+        row_id,
+        column,
+        op_id,
+    })
+}
+
+fn parse_piece_text_cleanup_buffers_elements(
+    elements: &[TupleElement],
+) -> Result<ParsedKey, KeyError> {
+    if elements.len() != 5 {
+        return Err(KeyError(format!(
+            "PieceTextCleanupBuffers key must have 5 elements, got {}",
+            elements.len()
+        )));
+    }
+
+    let table = element_to_string(&elements[1])?;
+    let row_id = element_to_int(&elements[2])?;
+    let column = element_to_string(&elements[3])?;
+    let op_id = element_to_int(&elements[4])?;
+
+    Ok(ParsedKey::PieceTextCleanupBuffers {
+        table,
+        row_id,
+        column,
+        op_id,
+    })
+}
+
 fn element_to_string(elem: &TupleElement) -> Result<String, KeyError> {
     match elem {
         TupleElement::Bytes(b) => {
@@ -881,6 +1100,18 @@ fn element_to_string(elem: &TupleElement) -> Result<String, KeyError> {
         }
         TupleElement::String(s) => Ok(s.clone()),
         _ => Err(KeyError("Expected string element".into())),
+    }
+}
+
+fn element_to_16_byte_array(elem: &TupleElement) -> Result<[u8; 16], KeyError> {
+    match elem {
+        TupleElement::Bytes(bytes) => bytes.as_slice().try_into().map_err(|_| {
+            KeyError(format!(
+                "Expected 16-byte element for op_id, got {} bytes",
+                bytes.len()
+            ))
+        }),
+        _ => Err(KeyError("Expected byte-string element".into())),
     }
 }
 
@@ -1368,6 +1599,274 @@ mod tests {
             }
             other => panic!("expected AclRule, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_piece_text_edit_key_roundtrip() {
+        let table = "channels";
+        let row_id = 42i64;
+        let column = "notes_pieces";
+        let op_id = [0xabu8; 16];
+        let key = piece_text_edit_key(table, row_id, column, op_id);
+        let parsed = parse_key(&key).unwrap();
+
+        assert_eq!(
+            parsed,
+            ParsedKey::PieceTextEdit {
+                table: table.to_string(),
+                row_id,
+                column: column.to_string(),
+                op_id,
+            }
+        );
+
+        let rebuilt = match parsed {
+            ParsedKey::PieceTextEdit {
+                table,
+                row_id,
+                column,
+                op_id,
+            } => piece_text_edit_key(&table, row_id, &column, op_id),
+            _ => unreachable!(),
+        };
+        assert_eq!(rebuilt, key);
+    }
+
+    #[test]
+    fn test_piece_text_edit_key_rejects_wrong_shapes() {
+        let op_id = [1u8; 16];
+        let too_short = encode_tuple(&[
+            TAG_PIECE_TEXT.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+        ]);
+        assert!(parse_key(&too_short).is_err());
+
+        let wrong_row_id_type = encode_tuple(&[
+            TAG_PIECE_TEXT.into(),
+            "channels".into(),
+            "42".into(),
+            "notes_pieces".into(),
+            op_id.as_slice().into(),
+        ]);
+        assert!(parse_key(&wrong_row_id_type).is_err());
+
+        let wrong_op_id_len = encode_tuple(&[
+            TAG_PIECE_TEXT.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            b"short".as_slice().into(),
+        ]);
+        assert!(parse_key(&wrong_op_id_len).is_err());
+
+        let too_long = encode_tuple(&[
+            TAG_PIECE_TEXT.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            op_id.as_slice().into(),
+            "extra".into(),
+        ]);
+        assert!(parse_key(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_piece_text_cleanup_pieces_key_roundtrip() {
+        let table = "channels";
+        let row_id = 42i64;
+        let column = "notes_pieces";
+        let op_id = 123i64;
+        let key = piece_text_cleanup_pieces_key(table, row_id, column, op_id);
+        let parsed = parse_key(&key).unwrap();
+
+        assert_eq!(
+            parsed,
+            ParsedKey::PieceTextCleanupPieces {
+                table: table.to_string(),
+                row_id,
+                column: column.to_string(),
+                op_id,
+            }
+        );
+
+        let rebuilt = match parsed {
+            ParsedKey::PieceTextCleanupPieces {
+                table,
+                row_id,
+                column,
+                op_id,
+            } => piece_text_cleanup_pieces_key(&table, row_id, &column, op_id),
+            _ => unreachable!(),
+        };
+        assert_eq!(rebuilt, key);
+    }
+
+    #[test]
+    fn test_piece_text_cleanup_buffers_key_roundtrip() {
+        let table = "channels";
+        let row_id = 42i64;
+        let column = "notes_pieces";
+        let op_id = 123i64;
+        let key = piece_text_cleanup_buffers_key(table, row_id, column, op_id);
+        let parsed = parse_key(&key).unwrap();
+
+        assert_eq!(
+            parsed,
+            ParsedKey::PieceTextCleanupBuffers {
+                table: table.to_string(),
+                row_id,
+                column: column.to_string(),
+                op_id,
+            }
+        );
+
+        let rebuilt = match parsed {
+            ParsedKey::PieceTextCleanupBuffers {
+                table,
+                row_id,
+                column,
+                op_id,
+            } => piece_text_cleanup_buffers_key(&table, row_id, &column, op_id),
+            _ => unreachable!(),
+        };
+        assert_eq!(rebuilt, key);
+    }
+
+    /// The two cleanup tags must not collide: a key built with one tag must not
+    /// parse as the other variant.
+    #[test]
+    fn test_piece_text_cleanup_tags_are_distinct() {
+        let pieces = piece_text_cleanup_pieces_key("channels", 42, "notes_pieces", 7);
+        let buffers = piece_text_cleanup_buffers_key("channels", 42, "notes_pieces", 7);
+        assert_ne!(pieces, buffers);
+        assert!(matches!(
+            parse_key(&pieces).unwrap(),
+            ParsedKey::PieceTextCleanupPieces { .. }
+        ));
+        assert!(matches!(
+            parse_key(&buffers).unwrap(),
+            ParsedKey::PieceTextCleanupBuffers { .. }
+        ));
+    }
+
+    #[test]
+    fn test_piece_text_cleanup_pieces_key_rejects_wrong_shapes() {
+        let too_short = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_PIECES.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+        ]);
+        assert!(parse_key(&too_short).is_err());
+
+        let wrong_row_id_type = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_PIECES.into(),
+            "channels".into(),
+            "42".into(),
+            "notes_pieces".into(),
+            12i64.into(),
+        ]);
+        assert!(parse_key(&wrong_row_id_type).is_err());
+
+        let wrong_op_id_type = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_PIECES.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            b"not-int".as_slice().into(),
+        ]);
+        assert!(parse_key(&wrong_op_id_type).is_err());
+
+        let too_long = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_PIECES.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            12i64.into(),
+            "extra".into(),
+        ]);
+        assert!(parse_key(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_piece_text_cleanup_buffers_key_rejects_wrong_shapes() {
+        let too_short = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_BUFFERS.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+        ]);
+        assert!(parse_key(&too_short).is_err());
+
+        let wrong_op_id_type = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_BUFFERS.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            b"not-int".as_slice().into(),
+        ]);
+        assert!(parse_key(&wrong_op_id_type).is_err());
+
+        let too_long = encode_tuple(&[
+            TAG_PIECE_TEXT_CLEANUP_BUFFERS.into(),
+            "channels".into(),
+            42i64.into(),
+            "notes_pieces".into(),
+            12i64.into(),
+            "extra".into(),
+        ]);
+        assert!(parse_key(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_unknown_tag_still_errors() {
+        let key = encode_tuple(&["UNKNOWN".into(), "x".into()]);
+        let err = parse_key(&key).unwrap_err();
+        assert!(err.to_string().contains("Unknown key type"));
+    }
+
+    #[test]
+    fn test_piece_coords_list_keys_use_piecetext_pieces_namespace() {
+        assert_eq!(
+            piece_coords_next_list_number_key(),
+            encode_tuple(&[
+                TAG_SCHEMA.into(),
+                PIECE_COORDS_TABLE.into(),
+                "next_list_number".into()
+            ])
+        );
+        assert_eq!(
+            piece_coords_head_key(7),
+            encode_tuple(&[
+                TAG_SCHEMA.into(),
+                PIECE_COORDS_TABLE.into(),
+                "head".into(),
+                7i64.into(),
+            ])
+        );
+        assert_eq!(
+            piece_coords_tail_key(7),
+            encode_tuple(&[
+                TAG_SCHEMA.into(),
+                PIECE_COORDS_TABLE.into(),
+                "tail".into(),
+                7i64.into(),
+            ])
+        );
+        assert_eq!(
+            piece_coords_parent_key(7),
+            encode_tuple(&[
+                TAG_SCHEMA.into(),
+                PIECE_COORDS_TABLE.into(),
+                "parent".into(),
+                7i64.into(),
+            ])
+        );
+        assert_ne!(piece_coords_head_key(7), list_head_key(7));
+        assert_ne!(piece_coords_tail_key(7), list_tail_key(7));
+        assert_ne!(piece_coords_parent_key(7), list_parent_key(7));
     }
 
     #[test]

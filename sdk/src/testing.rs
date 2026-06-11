@@ -41,7 +41,7 @@ use crate::{ApplicationSchema, DataCommitment, Schema};
 /// schema bundle will fail `Space::new`'s sanity expectation and the
 /// dedicated test in `lib.rs`, prompting an intentional update.
 const INITIAL_INTERNAL_DATA_COMMITMENT_HEX: &str =
-    "ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103";
+    "162af10e24b1d1029e8e91196a6fd3bf88987095ad0aa491db5d779fb98b4a09";
 
 /// Decoded form of [`INITIAL_INTERNAL_DATA_COMMITMENT_HEX`], used as
 /// the starting commitment for in-tree tests and the `Space::new`
@@ -130,6 +130,7 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            piece_text_caches: Arc::new(Mutex::new(HashMap::new())),
         };
         crate::broadcast::start_listener(&space);
         Ok(space)

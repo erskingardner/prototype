@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { listen } from "@tauri-apps/api/event";
+import { listenSafely } from "@/lib/tauri-events";
 import { useSpace, useSpaceDispatch } from "@/lib/store";
 import ChannelList from "@/components/channel-list";
 import ChannelHeader from "@/components/channel-header";
@@ -33,13 +33,10 @@ export default function ChatPage() {
 
   // Listen for logout event from OS menu
   useEffect(() => {
-    const unlisten = listen("logout", () => {
+    return listenSafely("logout", () => {
       dispatch({ type: "reset" });
       router.replace("/setup");
     });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   }, [dispatch, router]);
 
   if (!initialized) {

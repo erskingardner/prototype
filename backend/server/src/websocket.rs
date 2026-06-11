@@ -180,6 +180,30 @@ async fn send_broadcast(
     );
 }
 
+pub(crate) async fn send_cleanup_broadcast_to_space(
+    broadcast: &ProtoBroadcast,
+    conn_registry: &ConnectionRegistry,
+    space_id: SpaceId,
+) {
+    let reg = conn_registry.lock().await;
+    let connections = match reg.get(&space_id) {
+        Some(conns) => conns,
+        None => {
+            log::debug!("ws: cleanup broadcast skipped, no connections for space={space_id}");
+            return;
+        }
+    };
+
+    let recipients: Vec<&ClientConnection> = connections.iter().collect();
+    send_broadcast_to(broadcast, &recipients);
+
+    log::debug!(
+        "ws: broadcasted PieceText cleanup to {} connection(s) for space={}",
+        recipients.len(),
+        space_id
+    );
+}
+
 fn send_direct_response(
     payload: ws_frame::Payload,
     response_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -462,6 +486,22 @@ pub async fn client_connected(
 
     let connection_id =
         register_connection(&conn_registry, space_id, &auth_ctx, &response_tx).await;
+
+    {
+        let space = db::get_or_create_space(space_id, Some(&app_cfg)).await;
+        let mut space_state = space.lock().await;
+        if space_state.broadcast_cleanup.is_none() {
+            let registry = conn_registry.clone();
+            space_state.broadcast_cleanup = Some(Arc::new(move |sid, broadcast| {
+                let registry = registry.clone();
+                Box::pin(async move {
+                    send_cleanup_broadcast_to_space(&broadcast, &registry, sid).await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            }));
+        }
+        space_state.cleanup_state.auto_cleanup_enabled = true;
+    }
 
     let state = ConnectionState {
         space_id,

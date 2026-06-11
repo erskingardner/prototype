@@ -622,6 +622,74 @@ impl Space {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PieceCoordList — row-struct field type for `ColumnType::PieceText` columns
+// ---------------------------------------------------------------------------
+
+/// A reference to the `_piecetext_pieces` list backing a `ColumnType::PieceText`
+/// column. Stored as a bare `i64 list_number` on the wire (matching `List<T>`'s
+/// shape), but bound to the `_piecetext_pieces` infrastructure rather than
+/// `_lists`. Operate on the document via [`Space::piece_text`].
+#[derive(Clone, Debug)]
+pub struct PieceCoordList {
+    list_number: i64,
+}
+
+impl PieceCoordList {
+    /// Create an empty handle suitable for inserting a parent row. The server
+    /// auto-allocates a `list_number` against `piece_coords_next_list_number_key`
+    /// when the parent row is inserted.
+    pub fn empty() -> Self {
+        Self { list_number: 0 }
+    }
+
+    /// Construct a handle with a known `list_number`. Useful when restoring
+    /// state or in tests that pre-populate the address.
+    pub fn with_list_number(list_number: i64) -> Self {
+        Self { list_number }
+    }
+
+    /// The list_number, or 0 if not yet allocated.
+    pub fn list_number(&self) -> i64 {
+        self.list_number
+    }
+}
+
+impl Default for PieceCoordList {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Serialize for PieceCoordList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_i64(self.list_number)
+    }
+}
+
+impl<'de> Deserialize<'de> for PieceCoordList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let list_number = match value {
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| serde::de::Error::custom("expected integer for PieceCoordList"))?,
+            // Tolerate the enriched object shape produced by `hydrate_list_columns`,
+            // even though piece-text columns do not currently flow through that path.
+            serde_json::Value::Object(map) => map
+                .get("_li")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| serde::de::Error::custom("missing _li in PieceCoordList object"))?,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "expected integer or object for PieceCoordList",
+                ))
+            }
+        };
+        Ok(PieceCoordList { list_number })
+    }
+}
+
 #[cfg(all(test, feature = "local-transport"))]
 mod tests {
     use super::*;

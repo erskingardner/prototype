@@ -519,6 +519,214 @@ mod tests {
     use serial_test::serial;
     use temp_env;
 
+    /// Extract input steps from a fully-applied server history, build the
+    /// pruned-tree trace, and assert the FF-core flat verifier (the same routine
+    /// the RISC0 guest runs) accepts the whole range. Returns the steps so
+    /// callers can inspect read/write shape. Runs natively — no zkVM, no
+    /// `RISC0_DEV_MODE` — so it exercises the real proof path, not a fake.
+    fn verify_extracted_ff_core(server: &TestServer) -> Vec<InputStep> {
+        let start_idx = 0usize;
+        let tree_snapshot = server.tree_snapshot().expect("tree snapshot");
+        let steps = extract_input_steps(
+            server.changelog(),
+            server.responses(),
+            start_idx,
+            tree_snapshot,
+        )
+        .expect("extract_input_steps");
+        let tracer_proof = create_trace(tree_snapshot, &steps);
+        let pruned_tree_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+
+        let tail = server.changelog().get_tail(start_idx);
+        let entries: Vec<Vec<u8>> = tail.changes.iter().map(|e| e.as_bytes()).collect();
+        let end_idx = entries.len();
+        let responses = server.responses();
+        let range = FastForwardRange {
+            end_change_id: end_idx as u32,
+            start_clc_state: server.changelog().initial_clc_state(),
+            end_clc_state: server.changelog().current_clc_state(),
+            start_dc: responses[start_idx].old_root.into(),
+            end_dc: responses[start_idx + end_idx - 1].new_root.into(),
+            sigref_map: std::collections::BTreeMap::new(),
+            recent_roots: Vec::new(),
+            timestamp_hwm: 0,
+        };
+
+        let (entry_ends, entries_flat) = flatten_entry_bytes(&tail.changes);
+        let flat_entries = FlatEntryBytes::new(&entries_flat, &entry_ends).unwrap();
+        let mut sigref_map = std::collections::BTreeMap::new();
+        let mut recent_roots: Vec<(u32, [u8; 32])> = Vec::new();
+        let mut timestamp_hwm = 0;
+        assert!(
+            verify_op_sequence_flat(
+                flat_entries,
+                &range,
+                &pruned_tree_bytes,
+                start_idx as u32,
+                &mut sigref_map,
+                &mut recent_roots,
+                &mut timestamp_hwm,
+            ),
+            "extracted FF core verification failed"
+        );
+        steps
+    }
+
+    /// A mixed history (table insert + generic list append + two PieceTextEdit
+    /// appends) must extract to a self-consistent FF core that verifies.
+    #[tokio::test]
+    async fn test_ff_core_verifies_mixed_table_list_piece_text_history() {
+        let server = TestServer::new_mixed_table_list_piece_text_history().await;
+        let op_types: Vec<_> = server
+            .changelog()
+            .changes
+            .iter()
+            .map(|entry| entry.message.op_type)
+            .collect();
+        assert!(op_types.contains(&encrypted_spaces_changelog_core::changelog::OpType::Insert));
+        assert!(op_types.contains(&encrypted_spaces_changelog_core::changelog::OpType::ListAppend));
+        assert!(
+            op_types
+                .iter()
+                .filter(|op| {
+                    **op == encrypted_spaces_changelog_core::changelog::OpType::PieceTextEdit
+                })
+                .count()
+                >= 2,
+            "fixture must contain at least two PieceTextEdit changes"
+        );
+
+        verify_extracted_ff_core(&server);
+    }
+
+    /// Per-change cleanup proof-size budget (mirrors the server's
+    /// `CLEANUP_UPDATE_PROOF_BUDGET_BYTES`). Each cleanup op's pruned-tree update
+    /// proof must land under this so the system cleanup queue stays cheap.
+    const CLEANUP_UPDATE_PROOF_BUDGET_BYTES: usize = 128 * 1024;
+
+    /// A mixed history that drives both split cleanup ops — a signed
+    /// `PieceTextEdit` flow followed by a system-source `PieceTextCleanupPieces`
+    /// and a system-source `PieceTextCleanupBuffers` — must verify end to end in
+    /// the FF core (the same routine the RISC0 guest runs), and each cleanup op's
+    /// per-change update proof must stay within the cleanup budget.
+    #[tokio::test]
+    async fn test_piece_text_cleanup_native_prover_dispatches_and_bounds_proof() {
+        use encrypted_spaces_changelog_core::changelog::OpType;
+
+        let server = TestServer::new_piece_text_cleanup_history().await;
+        let op_types: Vec<_> = server
+            .changelog()
+            .changes
+            .iter()
+            .map(|entry| entry.message.op_type)
+            .collect();
+
+        // The fixture must exercise the full split-cleanup shape.
+        assert!(
+            op_types.contains(&OpType::PieceTextEdit),
+            "fixture must contain a PieceTextEdit change"
+        );
+        let pieces_idx = op_types
+            .iter()
+            .position(|op| *op == OpType::PieceTextCleanupPieces)
+            .expect("fixture must contain a PieceTextCleanupPieces change");
+        let buffers_idx = op_types
+            .iter()
+            .position(|op| *op == OpType::PieceTextCleanupBuffers)
+            .expect("fixture must contain a PieceTextCleanupBuffers change");
+
+        // The whole mixed history verifies through the FF core.
+        verify_extracted_ff_core(&server);
+
+        // Each cleanup op's per-change update proof stays within budget.
+        for (label, idx) in [
+            ("PieceTextCleanupPieces", pieces_idx),
+            ("PieceTextCleanupBuffers", buffers_idx),
+        ] {
+            let proof_bytes = server.responses()[idx].pruned_merkle_tree.len();
+            assert!(
+                proof_bytes < CLEANUP_UPDATE_PROOF_BUDGET_BYTES,
+                "{label} update proof is too large: {proof_bytes} bytes \
+                 (budget {CLEANUP_UPDATE_PROOF_BUDGET_BYTES})"
+            );
+        }
+    }
+
+    /// Stress/perf gate: optimized piece cleanup must visit far fewer
+    /// `_piecetext_pieces` rows than the legacy combined op, which re-read the whole
+    /// shrinking list on every chunk.
+    ///
+    /// Legacy worst case for a fully-tombstoned `MAX_PIECETEXT_PIECES_PER_DOCUMENT`
+    /// document, drained in `MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS`-sized chunks,
+    /// is `16,384 + 16,128 + ... + 256 = 532,480` row visits (see
+    /// PLAN_CLEANUP_OPTIMIZE "Current Behavior"). The split op instead reads each
+    /// removed row once — and no boundary survivor (those are derived from the
+    /// removed rows' prev_id/next_id, not read) — so total row visits are linear
+    /// in the document size.
+    #[tokio::test]
+    async fn test_piece_text_cleanup_pieces_worst_case_below_legacy_visits() {
+        use encrypted_spaces_changelog_core::piece_text::MAX_PIECETEXT_PIECES_PER_DOCUMENT;
+        use encrypted_spaces_changelog_core::piece_text_cleanup::MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS;
+        use encrypted_spaces_storage_encoding::keys::{parse_key, ParsedKey, PIECE_COORDS_TABLE};
+
+        let doc_rows = MAX_PIECETEXT_PIECES_PER_DOCUMENT;
+        let chunk = MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS;
+
+        // Legacy whole-list-per-chunk visit count for this worst case.
+        let num_chunks = doc_rows.div_ceil(chunk);
+        let legacy_visits: usize = (0..num_chunks).map(|k| doc_rows - chunk * k).sum();
+        assert_eq!(
+            legacy_visits, 532_480,
+            "legacy worst-case visit count should match the plan's 532,480 figure"
+        );
+
+        let server = TestServer::new_piece_text_cleanup_pieces_stress_history(doc_rows).await;
+
+        // Replay the cleanup history and count distinct `_piecetext_pieces` row reads.
+        // `read_piece_coords_row` reads each row's `list_number` column exactly
+        // once, so counting those Key reads counts row visits directly.
+        let steps = extract_input_steps(
+            server.changelog(),
+            server.responses(),
+            0,
+            server.tree_snapshot().expect("tree snapshot"),
+        )
+        .expect("extract_input_steps");
+
+        let mut optimized_visits = 0usize;
+        for step in &steps {
+            if let InputStep::Read(ops) = step {
+                for op in ops {
+                    if let encrypted_spaces_changelog_core::ReadOp::Key(key) = op {
+                        if let Ok(ParsedKey::Column { table, column, .. }) = parse_key(key) {
+                            if table == PIECE_COORDS_TABLE && column == "list_number" {
+                                optimized_visits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every tombstoned row is removed exactly once, and no boundary survivor
+        // rows are read — the survivors are derived from the removed rows' own
+        // prev_id/next_id — so the visit count is exactly `doc_rows`.
+        let expected_visits = doc_rows;
+        assert_eq!(
+            optimized_visits, expected_visits,
+            "optimized cleanup should read each removed row exactly once and read \
+             no boundary survivor rows"
+        );
+
+        // The headline claim: materially below the legacy 532,480-visit shape.
+        // Here it is ~32x fewer; require at least a 4x reduction as the gate.
+        assert!(
+            optimized_visits * 4 < legacy_visits,
+            "optimized cleanup row visits {optimized_visits} are not materially below \
+             the legacy {legacy_visits}-visit shape"
+        );
+    }
+
     // These tests are run with [serial] since each test is multi-core when `--features real-proofs` is used.
 
     // Proof mode (dev vs real) is handled by ensure_risc0_proof_mode()
@@ -1188,6 +1396,572 @@ mod tests {
                 &mut timestamp_hwm,
             ),
             "tampered parent_clc must be rejected by verify_op_sequence"
+        );
+    }
+
+    /// Stage 3a — Empty-range absence-proof spike (PLAN_CLEANUP_OPTIMIZE).
+    ///
+    /// Measures ONLY the empty-`_piecetext_pieces.buffer_id`-range (absence) proof
+    /// component of the future `PieceTextCleanupBuffers` op, for a full
+    /// buffer-cleanup chunk, in the *post-piece-cleanup* state. It does not build a
+    /// verifier op or a server path; it reuses the tracer idiom
+    /// (`create_trace` + `encode_pruned_compact`) and the resolver's own
+    /// `index_value_prefix` + `prefix_successor` range construction.
+    ///
+    /// The dominant unknown is the size of the surrounding live
+    /// `_piecetext_pieces.buffer_id` index and how sparsely the cleaned buffer ids
+    /// fall within it, so the spike sweeps index size × layout rather than
+    /// reporting a single point:
+    ///
+    /// * each absent target buffer id `Bi` is bracketed by **dense adjacent
+    ///   neighbor keys** (`Bi-1`, `Bi+1`, ... live), so each absence proof must
+    ///   descend to and include real boundary nodes;
+    /// * `clustered` tiles the target blocks into one contiguous keyspace region
+    ///   (rides shared subtrees — the friendly case);
+    /// * `sparse` spreads the 256 blocks by a huge stride across the full
+    ///   positive i64 keyspace (disjoint subtrees — the worst case);
+    /// * both layouts are run and the **max** is taken.
+    ///
+    /// `#[ignore]`d so it never runs in the normal sweep. Invoke explicitly:
+    ///
+    /// ```text
+    /// RISC0_SKIP_BUILD=1 RISC0_DEV_MODE=1 \
+    ///   cargo test -p encrypted-spaces-ffproof empty_range_proof_size -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "Stage 3a measurement spike; run explicitly with --ignored --nocapture"]
+    fn empty_range_proof_size() {
+        use encrypted_spaces_changelog_core::piece_text::MAX_PIECETEXT_PIECES_PER_DOCUMENT;
+        use encrypted_spaces_changelog_core::piece_text_cleanup::MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS;
+        use encrypted_spaces_changelog_core::piece_text_resolver::PIECE_COORDS_COL_BUFFER_ID;
+        use encrypted_spaces_storage_encoding::keys::{
+            index_key, index_value_prefix, row_id_to_bytes, PIECE_COORDS_TABLE,
+        };
+        use ffproof_tracer_shared::{prefix_successor, ReadOp};
+        use merk::InMemoryMerk;
+        use std::collections::HashSet;
+
+        // The named constant `CLEANUP_UPDATE_PROOF_BUDGET_BYTES` is introduced
+        // in a later stage; the spike hard-codes the plan's stated 128 KiB
+        // per-change cleanup budget so it can run standalone.
+        const CLEANUP_UPDATE_PROOF_BUDGET_BYTES: usize = 128 * 1024;
+        const HALF_BUDGET: usize = CLEANUP_UPDATE_PROOF_BUDGET_BYTES / 2;
+
+        // One cleanup chunk's worth of buffers - the unit the proof must cover.
+        let n_targets: usize = MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS;
+
+        // Build a `_piecetext_pieces.buffer_id` index merk tree from a sorted set of
+        // live buffer ids: one index entry per id, value = its row_id (8 bytes
+        // BE), exactly as `piece_text_resolver::index_put` writes it.
+        fn build_index_tree(live_ids: &[i64]) -> merk::Node {
+            let merk = InMemoryMerk::new();
+            for (i, &id) in live_ids.iter().enumerate() {
+                let row_id = (i as i64) + 1; // positive, unique
+                let key = index_key(PIECE_COORDS_TABLE, PIECE_COORDS_COL_BUFFER_ID, id, row_id)
+                    .expect("index_key");
+                merk.put(key, row_id_to_bytes(row_id).to_vec())
+                    .expect("merk put");
+            }
+            merk.snapshot().expect("non-empty index tree")
+        }
+
+        // One empty `ReadOp::Range` per absent target, built exactly like
+        // `piece_text_resolver` builds its `buffer_id` lookups.
+        fn empty_range_reads(targets: &[i64]) -> Vec<ReadOp> {
+            targets
+                .iter()
+                .map(|&bi| {
+                    let prefix =
+                        index_value_prefix(PIECE_COORDS_TABLE, PIECE_COORDS_COL_BUFFER_ID, bi)
+                            .expect("index_value_prefix");
+                    let end = prefix_successor(&prefix).expect("prefix has a successor");
+                    ReadOp::Range { start: prefix, end }
+                })
+                .collect()
+        }
+
+        // Construct (sorted live ids, absent targets) for a layout. `block_half`
+        // is the number of present neighbor ids on each side of every absent
+        // target (>= 1 guarantees the immediate `Bi-1`/`Bi+1` brackets are live,
+        // forcing each absence proof down to real boundary nodes). Total index
+        // size = n_targets * 2 * block_half.
+        fn layout(n_targets: usize, block_half: i64, sparse: bool) -> (Vec<i64>, Vec<i64>) {
+            let block_w = 2 * block_half + 1; // [Bi-H ..= Bi+H]
+            let stride: i64 = if sparse {
+                i64::MAX / (n_targets as i64 + 1)
+            } else {
+                block_w
+            };
+            let base: i64 = block_half + 1; // keeps the first Bi-block_half >= 1
+            let mut live = Vec::with_capacity(n_targets * 2 * block_half as usize);
+            let mut targets = Vec::with_capacity(n_targets);
+            for i in 0..n_targets as i64 {
+                let bi = base + i * stride;
+                targets.push(bi);
+                for d in 1..=block_half {
+                    live.push(bi - d);
+                    live.push(bi + d);
+                }
+            }
+            live.sort_unstable();
+            (live, targets)
+        }
+
+        let measure = |block_half: i64, sparse: bool| -> usize {
+            let (live, targets) = layout(n_targets, block_half, sparse);
+
+            // Confirm the construction really is an absence proof bracketed by
+            // dense neighbors: every target absent, every immediate neighbor
+            // present, all ids positive.
+            let live_set: HashSet<i64> = live.iter().copied().collect();
+            assert!(live.iter().all(|&x| x > 0), "live ids must be positive");
+            assert!(
+                targets.iter().all(|&b| !live_set.contains(&b)),
+                "every target must be absent from the index"
+            );
+            assert!(
+                targets
+                    .iter()
+                    .all(|&b| live_set.contains(&(b - 1)) && live_set.contains(&(b + 1))),
+                "every target must be bracketed by live Bi-1 / Bi+1 neighbors"
+            );
+
+            let tree = build_index_tree(&live);
+            let steps = vec![InputStep::Read(empty_range_reads(&targets))];
+            let proof = create_trace(&tree, &steps);
+            let bytes = encode_pruned_compact(&proof.pruned_tree);
+            eprintln!(
+                "  block_half={block_half:>3} index_size={:>6} {:<9} \
+                 full={:>5} pruned={:>5} -> {:>7} bytes ({:>3} bytes/buffer)",
+                live.len(),
+                if sparse { "sparse" } else { "clustered" },
+                proof.pruned_tree.count_full(),
+                proof.pruned_tree.count_pruned(),
+                bytes.len(),
+                bytes.len() / n_targets,
+            );
+            bytes.len()
+        };
+
+        eprintln!(
+            "\n[Stage 3a] empty-range absence-proof size for a {n_targets}-buffer cleanup chunk"
+        );
+        eprintln!(
+            "  budget CLEANUP_UPDATE_PROOF_BUDGET_BYTES = {CLEANUP_UPDATE_PROOF_BUDGET_BYTES} \
+             bytes (128 KiB); half = {HALF_BUDGET}\n"
+        );
+
+        // Sweep the surrounding-index size (via block_half) for both layouts.
+        // The headline block_half keeps the live index at the plan's
+        // per-document worst-case scale after the buffer cleanup cap changes.
+        assert_eq!(
+            MAX_PIECETEXT_PIECES_PER_DOCUMENT, 16_384,
+            "headline block_half assumes the documented 16,384 piece cap"
+        );
+        assert_eq!(
+            MAX_PIECETEXT_PIECES_PER_DOCUMENT % (n_targets * 2),
+            0,
+            "headline block_half assumes the piece cap divides evenly by target brackets"
+        );
+        let headline_block_half = (MAX_PIECETEXT_PIECES_PER_DOCUMENT / (n_targets * 2)) as i64;
+        let mut worst = 0usize;
+        let mut worst_at = (0i64, false);
+        let mut headline = 0usize;
+        for &block_half in &[1i64, 4, 16, 32, 64, 128] {
+            for &sparse in &[false, true] {
+                let n = measure(block_half, sparse);
+                if n > worst {
+                    worst = n;
+                    worst_at = (block_half, sparse);
+                }
+                if block_half == headline_block_half && sparse {
+                    headline = n; // document-cap index, worst-case layout
+                }
+            }
+        }
+
+        let verdict = |n: usize| -> &'static str {
+            if n < HALF_BUDGET {
+                "UNDER half-budget"
+            } else if n < CLEANUP_UPDATE_PROOF_BUDGET_BYTES {
+                "between half and full budget"
+            } else {
+                "OVER full budget"
+            }
+        };
+
+        eprintln!(
+            "\n  >>> WORST over sweep = {worst} bytes (block_half={}, {}) [{}]",
+            worst_at.0,
+            if worst_at.1 { "sparse" } else { "clustered" },
+            verdict(worst),
+        );
+        eprintln!(
+            "  >>> HEADLINE (16,384-entry index, sparse) = {headline} bytes [{}]",
+            verdict(headline),
+        );
+        eprintln!(
+            "  >>> Stage 3a decision: {}\n",
+            if headline < HALF_BUDGET {
+                "PASS — empty-range component well under half budget; Stage 3b greenlit."
+            } else if headline < CLEANUP_UPDATE_PROOF_BUDGET_BYTES {
+                "REVIEW — component above half budget; run the binding Stage 3b \
+                 full-op measurement and enable only if that stays under budget."
+            } else {
+                "ESCALATE — empty-range component alone exceeds the full per-change \
+                 budget. Do NOT build Stage 3b; use a specialized absence-proof helper \
+                 or refcounts (PLAN_CLEANUP_OPTIMIZE 'Why Not Refcounts')."
+            }
+        );
+
+        // Sanity floor only: the dense-neighbor brackets must have forced a
+        // non-trivial descent (a collapsed/empty proof would mean the
+        // measurement is broken, not that absence is free).
+        assert!(
+            headline > n_targets,
+            "empty-range absence proof collapsed ({headline} bytes for {n_targets} buffers); \
+             the dense-neighbor bracket did not force a real descent — measurement is broken"
+        );
+    }
+
+    /// Stage 3b - full `PieceTextCleanupBuffers` op proof-size measurement.
+    ///
+    /// Measures the real verifier path for a full buffer-cleanup chunk:
+    /// schema PieceText-column auth, `_piecetext_buffers` owner metadata reads, empty
+    /// `_piecetext_pieces.buffer_id` range reads, and derived `_piecetext_buffers` column and
+    /// owner-index deletes. The tree layout mirrors the Stage 3a absence spike:
+    /// every target buffer id is absent from the piece-coordinate index but
+    /// bracketed by dense live neighbor index keys, with both clustered and
+    /// sparse target layouts measured.
+    /// The reduced buffer-cleanup cap is accepted only if this binding full-op
+    /// measurement stays under the 128 KiB per-change cleanup budget.
+    ///
+    /// `#[ignore]`d so normal test sweeps skip it. Invoke explicitly:
+    ///
+    /// ```text
+    /// RISC0_SKIP_BUILD=1 RISC0_DEV_MODE=1 \
+    ///   cargo test -p encrypted-spaces-ffproof piece_text_cleanup_buffers_full_op_proof_size -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "Stage 3b proof-size measurement; run explicitly with --ignored --nocapture"]
+    fn piece_text_cleanup_buffers_full_op_proof_size() {
+        use encrypted_spaces_changelog_core::changelog::{
+            ChangelogEntry, ChangelogError, LogMessage, OpType, ROOT_TREE_PATH,
+        };
+        use encrypted_spaces_changelog_core::ops::{
+            OpContext, OpVerifier, PieceTextCleanupBuffersOp, ProverReader,
+        };
+        use encrypted_spaces_changelog_core::piece_text::{
+            PieceTextAddress, MAX_PIECETEXT_PIECES_PER_DOCUMENT,
+        };
+        use encrypted_spaces_changelog_core::piece_text_cleanup::{
+            PieceTextCleanupBuffersEnvelopeV1, MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS,
+            PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+        };
+        use encrypted_spaces_changelog_core::piece_text_resolver::{
+            BUFFERS_COL_OWNER_COLUMN, BUFFERS_COL_OWNER_ROW_ID, BUFFERS_COL_OWNER_TABLE,
+            PIECE_COORDS_COL_BUFFER_ID,
+        };
+        use encrypted_spaces_changelog_core::{ReadOp, TraceStep};
+        use encrypted_spaces_storage_encoding::keys::{
+            column_key, index_key, row_id_to_bytes, schema_piece_text_columns_key, BUFFERS_TABLE,
+            PIECE_COORDS_TABLE,
+        };
+        use encrypted_spaces_storage_encoding::stored_value::StoredValue;
+        use merk::{GetResult, InMemoryMerk};
+        use std::collections::{BTreeSet, HashSet};
+
+        const CLEANUP_UPDATE_PROOF_BUDGET_BYTES: usize = 128 * 1024;
+        const TABLE: &str = "docs";
+        const ROW_ID: i64 = 42;
+        const COLUMN: &str = "body";
+        const OP_ID: i64 = 77;
+        const BLOCK_HALF: i64 = 128;
+
+        fn stored_i64(value: i64) -> Vec<u8> {
+            postcard::to_allocvec(&StoredValue::I64(value)).expect("stored i64")
+        }
+
+        fn stored_string(value: &str) -> Vec<u8> {
+            postcard::to_allocvec(&StoredValue::String(value.to_string())).expect("stored string")
+        }
+
+        fn layout(n_targets: usize, block_half: i64, sparse: bool) -> (Vec<i64>, Vec<i64>) {
+            let block_w = 2 * block_half + 1;
+            let stride = if sparse {
+                i64::MAX / (n_targets as i64 + 1)
+            } else {
+                block_w
+            };
+            let base = block_half + 1;
+            let mut live = Vec::with_capacity(n_targets * 2 * block_half as usize);
+            let mut targets = Vec::with_capacity(n_targets);
+            for i in 0..n_targets as i64 {
+                let bi = base + i * stride;
+                targets.push(bi);
+                for d in 1..=block_half {
+                    live.push(bi - d);
+                    live.push(bi + d);
+                }
+            }
+            live.sort_unstable();
+            (live, targets)
+        }
+
+        fn put(merk: &InMemoryMerk, key: Vec<u8>, value: Vec<u8>) {
+            merk.put(key, value).expect("merk put");
+        }
+
+        fn build_tree(live_buffer_ids: &[i64], target_buffer_ids: &[i64]) -> merk::Node {
+            let merk = InMemoryMerk::new();
+            let mut piece_text_columns = BTreeSet::new();
+            piece_text_columns.insert(COLUMN.to_string());
+            put(
+                &merk,
+                schema_piece_text_columns_key(TABLE),
+                encrypted_spaces_storage_encoding::encode_column_names(&piece_text_columns),
+            );
+
+            for (i, &buffer_id) in live_buffer_ids.iter().enumerate() {
+                let row_id = (i as i64) + 1;
+                put(
+                    &merk,
+                    index_key(
+                        PIECE_COORDS_TABLE,
+                        PIECE_COORDS_COL_BUFFER_ID,
+                        buffer_id,
+                        row_id,
+                    )
+                    .expect("piece coord buffer_id index key"),
+                    row_id_to_bytes(row_id).to_vec(),
+                );
+            }
+
+            for &buffer_id in target_buffer_ids {
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, BUFFERS_COL_OWNER_TABLE),
+                    stored_string(TABLE),
+                );
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, BUFFERS_COL_OWNER_ROW_ID),
+                    stored_i64(ROW_ID),
+                );
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, BUFFERS_COL_OWNER_COLUMN),
+                    stored_string(COLUMN),
+                );
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, "author_id"),
+                    stored_i64(7),
+                );
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, "len_bytes"),
+                    stored_i64(4),
+                );
+                put(
+                    &merk,
+                    column_key(BUFFERS_TABLE, buffer_id, "contents"),
+                    vec![0xAB; 32],
+                );
+                for (column, value) in [
+                    (
+                        BUFFERS_COL_OWNER_COLUMN,
+                        encrypted_spaces_storage_encoding::TupleElement::String(COLUMN.to_string()),
+                    ),
+                    (
+                        BUFFERS_COL_OWNER_ROW_ID,
+                        encrypted_spaces_storage_encoding::TupleElement::Int(ROW_ID),
+                    ),
+                    (
+                        BUFFERS_COL_OWNER_TABLE,
+                        encrypted_spaces_storage_encoding::TupleElement::String(TABLE.to_string()),
+                    ),
+                ] {
+                    put(
+                        &merk,
+                        index_key(BUFFERS_TABLE, column, value, buffer_id)
+                            .expect("buffer owner index key"),
+                        row_id_to_bytes(buffer_id).to_vec(),
+                    );
+                }
+            }
+
+            merk.snapshot().expect("cleanup proof tree snapshot")
+        }
+
+        fn envelope(targets: &[i64]) -> PieceTextCleanupBuffersEnvelopeV1 {
+            PieceTextCleanupBuffersEnvelopeV1 {
+                version: PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+                address: PieceTextAddress {
+                    table: TABLE.to_string(),
+                    row_id: ROW_ID,
+                    column: COLUMN.to_string(),
+                },
+                op_id: OP_ID,
+                buffer_removals: targets.to_vec(),
+            }
+        }
+
+        fn entry(env: &PieceTextCleanupBuffersEnvelopeV1) -> ChangelogEntry {
+            ChangelogEntry {
+                timestamp: 1,
+                uid: 0,
+                parent_change: 0,
+                message: LogMessage {
+                    op_type: OpType::PieceTextCleanupBuffers,
+                    tree_path: ROOT_TREE_PATH.to_vec(),
+                    entries: vec![env.changelog_entry_kv().expect("cleanup manifest kv")],
+                },
+                sig_ref: 0,
+                parent_clc: [0u8; 32],
+                signature: Vec::new(),
+            }
+        }
+
+        fn proven_read_from_tree(
+            tree: &merk::Node,
+            op: &ReadOp,
+        ) -> Result<encrypted_spaces_changelog_core::ProvenRead, ChangelogError> {
+            let results = match op {
+                ReadOp::Key(key) => match tree.get_value(key).map_err(|e| {
+                    ChangelogError::Generic(format!(
+                        "tree read failed for key {}: {e:?}",
+                        hex::encode(key)
+                    ))
+                })? {
+                    GetResult::Found(value) => vec![(key.clone(), value)],
+                    GetResult::NotFound => Vec::new(),
+                    GetResult::Pruned => {
+                        return Err(ChangelogError::Generic(format!(
+                            "pruned node encountered for key {}",
+                            hex::encode(key)
+                        )));
+                    }
+                },
+                ReadOp::Prefix(prefix) => {
+                    let end = ffproof_tracer_shared::prefix_successor(prefix);
+                    ffproof_tracer_shared::collect_range(tree, prefix, end.as_deref())
+                }
+                ReadOp::Range { start, end } => {
+                    ffproof_tracer_shared::collect_range(tree, start, Some(end.as_slice()))
+                }
+            };
+            Ok(encrypted_spaces_changelog_core::ProvenRead {
+                op: op.clone(),
+                results,
+            })
+        }
+
+        fn extract_full_op_steps(tree: &merk::Node, targets: &[i64]) -> Vec<InputStep> {
+            let env = envelope(targets);
+            let change = entry(&env);
+            let ctx = OpContext::for_change_id(OP_ID as usize);
+            let mut reader = ProverReader::new(|op| proven_read_from_tree(tree, op));
+            let op_result =
+                PieceTextCleanupBuffersOp::extract_and_validate(&change, &mut reader, &ctx)
+                    .expect("cleanup op measurement");
+
+            let mut steps = Vec::new();
+            for read_op in reader.logged_reads {
+                steps.push(InputStep::Read(vec![read_op]));
+            }
+            for write_step in op_result.write_steps {
+                match write_step {
+                    TraceStep::Write(ops) => steps.push(InputStep::Write(ops)),
+                    TraceStep::Read(_) => panic!("op verifier returned a read trace step"),
+                }
+            }
+            steps
+        }
+
+        fn measure(sparse: bool) -> usize {
+            let n_targets = MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS;
+            let (live, targets) = layout(n_targets, BLOCK_HALF, sparse);
+            assert_eq!(
+                live.len(),
+                MAX_PIECETEXT_PIECES_PER_DOCUMENT,
+                "full-op proof measurement must keep the surrounding buffer_id index at document-cap scale"
+            );
+            let live_set: HashSet<i64> = live.iter().copied().collect();
+            assert!(live.iter().all(|&x| x > 0), "live ids must be positive");
+            assert!(
+                targets.iter().all(|&b| !live_set.contains(&b)),
+                "target buffers must be absent from _piecetext_pieces.buffer_id"
+            );
+            assert!(
+                targets
+                    .iter()
+                    .all(|&b| live_set.contains(&(b - 1)) && live_set.contains(&(b + 1))),
+                "every target must be bracketed by live Bi-1 / Bi+1 neighbors"
+            );
+
+            let tree = build_tree(&live, &targets);
+            let steps = extract_full_op_steps(&tree, &targets);
+            let write_ops = steps
+                .iter()
+                .filter_map(|step| match step {
+                    InputStep::Write(ops) => Some(ops.len()),
+                    InputStep::Read(_) => None,
+                })
+                .sum::<usize>();
+            let read_ops = steps
+                .iter()
+                .filter_map(|step| match step {
+                    InputStep::Read(ops) => Some(ops.len()),
+                    InputStep::Write(_) => None,
+                })
+                .sum::<usize>();
+            let proof = create_trace(&tree, &steps);
+            let bytes = encode_pruned_compact(&proof.pruned_tree);
+            eprintln!(
+                "  {:<9} targets={n_targets} index_size={:>6} reads={read_ops:>4} \
+                 writes={write_ops:>5} full={:>5} pruned={:>5} -> {:>7} bytes",
+                if sparse { "sparse" } else { "clustered" },
+                live.len(),
+                proof.pruned_tree.count_full(),
+                proof.pruned_tree.count_pruned(),
+                bytes.len(),
+            );
+            bytes.len()
+        }
+
+        eprintln!(
+            "\n[Stage 3b] PieceTextCleanupBuffers full-op proof size for a {}-buffer chunk",
+            MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS
+        );
+        eprintln!(
+            "  budget CLEANUP_UPDATE_PROOF_BUDGET_BYTES = {CLEANUP_UPDATE_PROOF_BUDGET_BYTES} bytes (128 KiB)\n"
+        );
+
+        let clustered = measure(false);
+        let sparse = measure(true);
+        let worst = clustered.max(sparse);
+        eprintln!("\n  >>> WORST full-op proof = {worst} bytes\n");
+
+        eprintln!(
+            "  >>> Stage 3b decision: {}\n",
+            if worst < CLEANUP_UPDATE_PROOF_BUDGET_BYTES {
+                "PASS - full op is under budget; dispatch can be reconsidered."
+            } else {
+                "ESCALATE - full op exceeds budget; dispatch must remain disabled."
+            }
+        );
+
+        assert!(
+            worst > MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS,
+            "full-op proof collapsed ({worst} bytes for {} buffers); measurement is broken",
+            MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS
+        );
+        assert!(
+            worst < CLEANUP_UPDATE_PROOF_BUDGET_BYTES,
+            "PieceTextCleanupBuffers full-op proof {worst} bytes exceeds \
+             CLEANUP_UPDATE_PROOF_BUDGET_BYTES {CLEANUP_UPDATE_PROOF_BUDGET_BYTES} \
+             at cap {MAX_PIECE_TEXT_CLEANUP_BUFFER_REMOVALS}"
         );
     }
 }

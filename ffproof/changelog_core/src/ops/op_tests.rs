@@ -20,6 +20,7 @@ mod tests {
     use encrypted_spaces_storage_encoding::keys::{
         acl_rule_key, column_key, column_key_placeholder, schema_columns_key, schema_id_mode_key,
         schema_indexes_key, schema_list_columns_key, schema_next_id_key,
+        schema_piece_text_columns_key,
     };
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
 
@@ -628,13 +629,18 @@ mod tests {
                 results: vec![],
             },
             ProvenRead {
+                op: ReadOp::Key(schema_piece_text_columns_key("t")),
+                results: vec![],
+            },
+            ProvenRead {
                 op: ReadOp::Key(b"extra_key".to_vec()),
                 results: vec![(b"extra_key".to_vec(), b"extra".to_vec())],
             },
         ];
         let mut reader = VerifierReader::new(&reads);
 
-        // extract_and_validate succeeds (it consumes id_mode + user + columns + list_columns + indexes + next_id)
+        // extract_and_validate succeeds (it consumes id_mode + user + columns
+        // + list_columns + indexes + piece_text_columns + next_id)
         let result = InsertOp::extract_and_validate(&entry, &mut reader, &no_acl());
         assert!(result.is_ok());
 

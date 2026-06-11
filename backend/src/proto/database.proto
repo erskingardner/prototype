@@ -127,6 +127,7 @@ enum ColumnType {
   BLOB = 4;
   FILE_REF = 5;
   LIST = 6;
+  PIECE_TEXT = 7;
 }
 
 message QueryParam {

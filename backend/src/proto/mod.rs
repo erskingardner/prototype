@@ -72,6 +72,7 @@ impl From<&schema::ColumnDefinition> for ColumnDefinition {
                 schema::ColumnType::List => ColumnType::List as i32,
                 schema::ColumnType::Text => ColumnType::Text as i32,
                 schema::ColumnType::Blob => ColumnType::Blob as i32,
+                schema::ColumnType::PieceText => ColumnType::PieceText as i32,
             },
             plaintext: col.plaintext,
             indexed: col.indexed,
@@ -84,14 +85,21 @@ impl From<ColumnDefinition> for schema::ColumnDefinition {
         schema::ColumnDefinition {
             name: col.name,
             column_type: match col.column_type {
-                0 => schema::ColumnType::Integer, // INTEGER
-                1 => schema::ColumnType::Real,    // REAL
-                2 => schema::ColumnType::String,  // STRING
-                3 => schema::ColumnType::Text,    // TEXT
-                4 => schema::ColumnType::Blob,    // BLOB
-                5 => schema::ColumnType::FileRef, // FILE_REF
-                6 => schema::ColumnType::List,    // LIST
-                _ => schema::ColumnType::String,  // default
+                0 => schema::ColumnType::Integer,   // INTEGER
+                1 => schema::ColumnType::Real,      // REAL
+                2 => schema::ColumnType::String,    // STRING
+                3 => schema::ColumnType::Text,      // TEXT
+                4 => schema::ColumnType::Blob,      // BLOB
+                5 => schema::ColumnType::FileRef,   // FILE_REF
+                6 => schema::ColumnType::List,      // LIST
+                7 => schema::ColumnType::PieceText, // PIECE_TEXT
+                // Unknown ColumnType discriminant (forward-compatible or
+                // attacker-influenced bytes): fall back to the historical
+                // `String` default rather than panicking. This `From` is
+                // infallible by trait, and the prior behavior decoded unknown
+                // values as `String`. Mirrors the `unwrap_or(default)` handling
+                // in the sibling `ComparisonOperator`/`OpType` decoders below.
+                _ => schema::ColumnType::String,
             },
             plaintext: col.plaintext,
             indexed: col.indexed,
@@ -686,6 +694,87 @@ mod tests {
             }),
             expected_inclusion_proofs: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn schema_proto_roundtrip_preserves_piece_text_column_type() {
+        let schema = schema::Schema {
+            name: "docs".to_string(),
+            columns: vec![
+                schema::ColumnDefinition {
+                    name: "id".to_string(),
+                    column_type: schema::ColumnType::Integer,
+                    plaintext: true,
+                    indexed: false,
+                },
+                schema::ColumnDefinition {
+                    name: "body".to_string(),
+                    column_type: schema::ColumnType::PieceText,
+                    plaintext: true,
+                    indexed: false,
+                },
+            ],
+            auto_increment: true,
+        };
+
+        let proto: Schema = (&schema).into();
+        assert_eq!(proto.columns[1].column_type, ColumnType::PieceText as i32);
+
+        let decoded: schema::Schema = proto.into();
+        assert!(matches!(
+            decoded.columns[1].column_type,
+            schema::ColumnType::PieceText
+        ));
+    }
+
+    #[test]
+    fn unknown_proto_column_type_decodes_to_string_sentinel() {
+        // An out-of-range `column_type` (e.g. attacker-influenced or
+        // forward-compatible bytes) must decode without panicking. It falls
+        // back to the historical `String` default sentinel.
+        let decoded: schema::ColumnDefinition = ColumnDefinition {
+            name: "mystery".to_string(),
+            column_type: 99,
+            plaintext: true,
+            indexed: false,
+        }
+        .into();
+        assert!(matches!(decoded.column_type, schema::ColumnType::String));
+    }
+
+    #[test]
+    fn unknown_proto_column_type_in_schema_decodes_without_panicking() {
+        // A full `Schema` carrying an unknown column type decodes through the
+        // chained `From<Schema>` path without panicking, defaulting the
+        // offending column to `String` while preserving the rest.
+        let proto = Schema {
+            name: "notes".to_string(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Integer as i32,
+                    plaintext: true,
+                    indexed: false,
+                },
+                ColumnDefinition {
+                    name: "mystery".to_string(),
+                    column_type: 1234,
+                    plaintext: true,
+                    indexed: false,
+                },
+            ],
+            auto_increment: true,
+        };
+
+        let decoded: schema::Schema = proto.into();
+        assert!(matches!(
+            decoded.columns[0].column_type,
+            schema::ColumnType::Integer
+        ));
+        assert!(matches!(
+            decoded.columns[1].column_type,
+            schema::ColumnType::String
+        ));
     }
 
     #[test]

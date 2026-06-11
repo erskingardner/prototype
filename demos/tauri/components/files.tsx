@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { open, save, confirm } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
-import { listen } from "@tauri-apps/api/event";
+import { listenSafely } from "@/lib/tauri-events";
 import { useSpace, useSpaceDispatch } from "@/lib/store";
 import * as api from "@/lib/api";
 import { INODE_FILE, INODE_FOLDER, ROOT_PARENT, type InodeWithAuthor } from "@/lib/types";
@@ -63,8 +63,7 @@ export default function Files() {
 
   // Refresh when broadcast arrives (e.g. another user uploaded)
   useEffect(() => {
-    const unlisten = listen("space-updated", () => { refresh(); });
-    return () => { unlisten.then((fn) => fn()); };
+    return listenSafely("space-updated", () => { refresh(); });
   }, [refresh]);
 
   // Separate folders and files

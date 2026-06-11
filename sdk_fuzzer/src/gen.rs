@@ -26,7 +26,10 @@ const PLAIN_COLUMN_TYPES: &[ColumnType] =
 /// participate in predicates / joins; `ColumnType::FileRef` cells store a
 /// hex SHA-256 hash and require an upload before insert.  Those types live
 /// behind dedicated ops, so we mix them in less frequently than plain
-/// scalars.
+/// scalars. `PieceText` is intentionally excluded for now: the fuzzer
+/// does not yet have a PieceText document model or random PieceText edit ops, so
+/// generating PieceText columns would create cells it never exercises
+/// correctly.
 const SPECIAL_COLUMN_TYPES: &[ColumnType] = &[ColumnType::List, ColumnType::FileRef];
 
 pub fn random_table_name(rng: &mut impl Rng, existing: &[&str]) -> String {
@@ -100,7 +103,10 @@ pub fn random_schema(rng: &mut impl Rng, name: String) -> Schema {
         } else {
             SPECIAL_COLUMN_TYPES[rng.random_range(0..SPECIAL_COLUMN_TYPES.len())].clone()
         };
-        let is_special = matches!(column_type, ColumnType::List | ColumnType::FileRef);
+        let is_special = matches!(
+            column_type,
+            ColumnType::List | ColumnType::PieceText | ColumnType::FileRef
+        );
         // List / FileRef can't be indexed.
         let indexed = !is_special && (i == force_indexed_slot || rng.random_bool(0.4));
         // Indexed columns must be plaintext.  List and FileRef columns must
@@ -108,7 +114,10 @@ pub fn random_schema(rng: &mut impl Rng, name: String) -> Schema {
         // (the verifier substitutes the allocated list_number), and FileRef
         // cells need the server to read the hash for lifecycle management.
         let plaintext = indexed
-            || matches!(column_type, ColumnType::FileRef | ColumnType::List)
+            || matches!(
+                column_type,
+                ColumnType::FileRef | ColumnType::List | ColumnType::PieceText
+            )
             || rng.random_bool(0.5);
         columns.push(ColumnDefinition {
             name: col_name,
@@ -185,7 +194,7 @@ pub fn random_row_with_overrides_owned(
             continue;
         }
         let value = match col.column_type {
-            ColumnType::List => Value::from(0),
+            ColumnType::List | ColumnType::PieceText => Value::from(0),
             ColumnType::FileRef => Value::Null,
             _ => random_scalar_value(rng, &col.column_type),
         };
@@ -217,7 +226,9 @@ pub fn random_scalar_value(rng: &mut impl Rng, ty: &ColumnType) -> Value {
         ColumnType::String | ColumnType::Text => Value::String(random_text(rng, 0, 16)),
         // Special types have no scalar representation here — caller must
         // override via `RowOverrides`.
-        ColumnType::Blob | ColumnType::FileRef | ColumnType::List => Value::Null,
+        ColumnType::Blob | ColumnType::FileRef | ColumnType::List | ColumnType::PieceText => {
+            Value::Null
+        }
     }
 }
 
@@ -795,6 +806,32 @@ fn random_action_name(rng: &mut impl Rng, existing: &std::collections::HashSet<S
         let name = format!("act_{body}");
         if !existing.contains(&name) {
             return name;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn random_schema_intentionally_excludes_piece_text() {
+        assert!(
+            !SPECIAL_COLUMN_TYPES.contains(&ColumnType::PieceText),
+            "PieceText must stay out of random schemas until the fuzzer has PieceText ops"
+        );
+
+        let mut rng = StdRng::seed_from_u64(0x5eed);
+        for i in 0..256 {
+            let schema = random_schema(&mut rng, format!("t{i}"));
+            assert!(
+                schema
+                    .columns
+                    .iter()
+                    .all(|c| c.column_type != ColumnType::PieceText),
+                "random_schema generated PieceText without a PieceText operation model: {schema:?}"
+            );
         }
     }
 }

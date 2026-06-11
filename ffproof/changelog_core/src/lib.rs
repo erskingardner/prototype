@@ -2,6 +2,13 @@
 pub mod changelog;
 pub mod mmr_tree;
 pub mod ops;
+pub mod piece_text;
+pub mod piece_text_cleanup;
+pub mod piece_text_legacy_limits;
+pub mod piece_text_overlay;
+pub mod piece_text_planner;
+mod piece_text_resolution;
+pub mod piece_text_resolver;
 pub mod time;
 
 // Re-export key construction from storage-encoding

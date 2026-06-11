@@ -22,7 +22,7 @@ export default function ChannelList() {
         api.getMessages(channelId),
         api.getReactions(channelId),
         api.getTasks(),
-        api.getNotes(),
+        api.getNotes(channelId),
       ]);
       dispatch({ type: "setMessages", messages });
       dispatch({ type: "setReactions", reactions });

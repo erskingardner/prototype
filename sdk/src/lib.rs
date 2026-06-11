@@ -9,6 +9,7 @@ mod key_manager;
 pub mod list;
 #[cfg(feature = "local-transport")]
 pub mod local_transport;
+mod piecetext;
 pub(crate) mod retention;
 pub mod schema;
 mod state;
@@ -24,9 +25,10 @@ pub mod websocket_transport;
 
 pub use crate::file::File;
 pub(crate) use crate::key_manager::KeyManagerHandle;
-pub use crate::list::{List, ListEntry};
+pub use crate::list::{List, ListEntry, PieceCoordList};
 #[cfg(feature = "local-transport")]
 pub use crate::local_transport::LocalTransport;
+pub use crate::piecetext::PieceTextArea;
 pub use crate::schema::{ApplicationSchema, ColumnType, Schema, SchemaBuilder};
 pub use crate::table::Table;
 pub use crate::textarea::TextArea;
@@ -69,7 +71,7 @@ use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
 
 /// Concrete KeyManager type used throughout the SDK.
 pub(crate) type SpaceKeyManager = KeyManager<SimpleLine2SpaceKey>;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The current data commitment (Merk root).
@@ -151,6 +153,8 @@ pub struct Space {
     /// fail fast (the outer apply then rolls back and the caller retries)
     /// instead of deadlocking. See issue #212, fix #4.
     pub(crate) ff_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) piece_text_caches:
+        Arc<Mutex<HashMap<piecetext::PieceTextAddress, Arc<piecetext::PieceTextCache>>>>,
 }
 
 impl Space {
@@ -235,6 +239,7 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            piece_text_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Build the insert without an explicit id so `_users` (an auto-
@@ -249,6 +254,7 @@ impl Space {
         space.register_table_schema(access_control_schema());
         space.initialize_key_history();
         space.initialize_lists();
+        space.initialize_piece_text();
         space.initialize_users().await?;
         space.initialize_retention().await?;
 
@@ -377,12 +383,14 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            piece_text_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Register internal table schemas locally (tables are auto-created on the backend)
         space.register_table_schema(access_control_schema());
         space.initialize_key_history();
         space.initialize_lists();
+        space.initialize_piece_text();
         space.initialize_users().await?;
         space.initialize_retention().await?;
 
@@ -500,6 +508,7 @@ impl Clone for Space {
             updates_tx: self.updates_tx.clone(),
             serialize_mutations: Arc::clone(&self.serialize_mutations),
             ff_in_progress: Arc::clone(&self.ff_in_progress),
+            piece_text_caches: Arc::clone(&self.piece_text_caches),
         }
     }
 }
@@ -548,7 +557,7 @@ mod tests {
         let transport = LocalTransport::in_memory().await?;
         let actual = transport.get_root_hash().await?;
         let actual_hex = hex::encode(actual);
-        expect!["ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103"]
+        expect!["162af10e24b1d1029e8e91196a6fd3bf88987095ad0aa491db5d779fb98b4a09"]
             .assert_eq(&actual_hex);
         assert_eq!(crate::testing::initial_internal_data_commitment(), actual);
         Ok(())
@@ -1703,7 +1712,7 @@ mod tests {
         name: String,
         description: Option<String>,
         tasks: crate::List,
-        notes: crate::TextArea,
+        notes: crate::PieceCoordList,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1752,7 +1761,7 @@ mod tests {
     }
 
     async fn bootstrap_demo_like(space: &Space, user_name: &str) -> Result<i64> {
-        let uid = space.get_auth_context().uid.unwrap();
+        let uid = space.uid().unwrap() as i64;
 
         let existing_meta: Option<DemoUsersMeta> = space
             .table::<DemoUsersMeta>("users_meta")
@@ -1790,7 +1799,7 @@ mod tests {
                 name: "general".to_string(),
                 description: None,
                 tasks: crate::List::empty(),
-                notes: crate::TextArea::empty(),
+                notes: crate::PieceCoordList::empty(),
             })
             .execute()
             .await
@@ -1891,7 +1900,7 @@ mod tests {
                 name: "alpha".to_string(),
                 description: None,
                 tasks: crate::List::empty(),
-                notes: crate::TextArea::empty(),
+                notes: crate::PieceCoordList::empty(),
             })
             .execute()
             .await?;

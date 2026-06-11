@@ -76,6 +76,98 @@ pub enum OpType {
     /// sigref, pruned tree, overlay) without any table reads or writes.
     /// Rejected by the production server write path.
     Noop = 15,
+    /// Atomic piece-table text edit backed by `_piecetext_pieces` and `_piecetext_buffers`.
+    /// This is a user-source op and participates in the normal sigref chain.
+    /// Wire values 14 and 15 are already occupied by `Action` and `Noop` on
+    /// current main, so PieceText starts at the next free value.
+    PieceTextEdit = 16,
+    /// System-source garbage collection: physically remove already-tombstoned
+    /// `_piecetext_pieces` rows and relink the surviving chain. Does not touch
+    /// `_piecetext_buffers`. Reuses wire value `17` (the old combined `PieceTextCleanup`).
+    PieceTextCleanupPieces = 17,
+    /// System-source garbage collection: physically delete `_piecetext_buffers` rows whose
+    /// `_piecetext_pieces.buffer_id` index range is empty after piece cleanup has
+    /// already committed.
+    PieceTextCleanupBuffers = 18,
+}
+
+/// Returns true for ops emitted by the system rather than a user.
+///
+/// System-source ops do not participate in the per-user sigref chain. Keep this
+/// match exhaustive so future `OpType` additions require an explicit source
+/// classification decision.
+pub fn is_system_op_type(op_type: OpType) -> bool {
+    match op_type {
+        OpType::Insert
+        | OpType::Update
+        | OpType::Delete
+        | OpType::ListInsert
+        | OpType::ListUpdate
+        | OpType::ListDelete
+        | OpType::CreateSpace
+        | OpType::RefreshKeys
+        | OpType::InviteUser
+        | OpType::RemoveUser
+        | OpType::Extend
+        | OpType::Reduce
+        | OpType::Rekey
+        | OpType::ListAppend
+        | OpType::Action
+        | OpType::Noop
+        | OpType::PieceTextEdit => false,
+        OpType::PieceTextCleanupPieces | OpType::PieceTextCleanupBuffers => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationClass {
+    SystemSource,
+    UserSource,
+}
+
+/// Classify a changelog entry's source and validate local sentinel fields.
+///
+/// # System-source (PieceText cleanup) trust model
+///
+/// `PieceTextCleanupPieces` and `PieceTextCleanupBuffers` are the only
+/// system-source ops. The verifier deliberately skips signature/sigref auth for
+/// them, so soundness rests on each cleanup verifier re-deriving every deletion
+/// and relink from authenticated state: piece cleanup addresses an authenticated
+/// parent `(table, row_id, column, list_number)`, removes only already-
+/// tombstoned `_piecetext_pieces` rows via local linked-list splices, and re-derives
+/// the relinks; buffer cleanup deletes `_piecetext_buffers` rows only when the
+/// `_piecetext_pieces.buffer_id` index range is already empty. Both require the
+/// envelope `op_id` to match `current_change_id`. The production server cleanup
+/// queue is the sole intended producer; user-submitted cleanup is rejected in
+/// `SpaceState::handle_change`.
+///
+/// We intentionally do not check `entry.signature.is_empty()` for system-source
+/// ops. The in-guest verification decoder strips signatures before this runs,
+/// so such a check would be inert. The load-bearing gate against forged cleanup
+/// entries is the server-side rejection plus the verifier constraints above.
+pub fn classify_changelog_entry(
+    entry: &ChangelogEntry,
+) -> Result<AuthenticationClass, ChangelogError> {
+    if is_system_op_type(entry.message.op_type) {
+        if entry.uid != 0 {
+            return Err(ChangelogError::Generic(
+                "system-source op must have uid == 0".to_string(),
+            ));
+        }
+        if entry.sig_ref != 0 {
+            return Err(ChangelogError::Generic(
+                "system-source op must have sig_ref == 0".to_string(),
+            ));
+        }
+        Ok(AuthenticationClass::SystemSource)
+    } else {
+        if entry.uid == 0 {
+            return Err(ChangelogError::Generic(
+                "user-source op must not use uid 0".to_string(),
+            ));
+        }
+        Ok(AuthenticationClass::UserSource)
+    }
 }
 
 type Time = u64;
@@ -527,6 +619,9 @@ impl OpType {
             13 => Some(OpType::ListAppend),
             14 => Some(OpType::Action),
             15 => Some(OpType::Noop),
+            16 => Some(OpType::PieceTextEdit),
+            17 => Some(OpType::PieceTextCleanupPieces),
+            18 => Some(OpType::PieceTextCleanupBuffers),
             _ => None,
         }
     }
@@ -1961,16 +2056,27 @@ fn verify_op_sequence_with_tree(
             return false;
         }
 
-        if !validate_sigref(
-            sigref_map,
-            entry_i.uid,
-            entry_i.sig_ref,
-            current_change_id as u32,
-            (*leaf_hash.as_bytes())
-                .try_into()
-                .expect("digest is 32 bytes"),
-        ) {
-            return false;
+        match classify_changelog_entry(&entry_i) {
+            Ok(AuthenticationClass::SystemSource) => {}
+            Ok(AuthenticationClass::UserSource) => {
+                if !validate_sigref(
+                    sigref_map,
+                    entry_i.uid,
+                    entry_i.sig_ref,
+                    current_change_id as u32,
+                    (*leaf_hash.as_bytes())
+                        .try_into()
+                        .expect("digest is 32 bytes"),
+                ) {
+                    return false;
+                }
+            }
+            Err(e) => {
+                println!(
+                    "Changelog source classification failed at entry {current_change_id}: {e}"
+                );
+                return false;
+            }
         }
 
         if !validate_parent_change(entry_i.parent_change, current_change_id) {
@@ -2263,16 +2369,27 @@ fn verify_op_sequence_timed_inner(
         }
 
         let t0 = cycle_count();
-        if !validate_sigref(
-            sigref_map,
-            entry_i.uid,
-            entry_i.sig_ref,
-            current_change_id as u32,
-            (*leaf_hash.as_bytes())
-                .try_into()
-                .expect("digest is 32 bytes"),
-        ) {
-            return (false, timings);
+        match classify_changelog_entry(&entry_i) {
+            Ok(AuthenticationClass::SystemSource) => {}
+            Ok(AuthenticationClass::UserSource) => {
+                if !validate_sigref(
+                    sigref_map,
+                    entry_i.uid,
+                    entry_i.sig_ref,
+                    current_change_id as u32,
+                    (*leaf_hash.as_bytes())
+                        .try_into()
+                        .expect("digest is 32 bytes"),
+                ) {
+                    return (false, timings);
+                }
+            }
+            Err(e) => {
+                println!(
+                    "Changelog source classification failed at entry {current_change_id}: {e}"
+                );
+                return (false, timings);
+            }
         }
 
         if !validate_parent_change(entry_i.parent_change, current_change_id) {
@@ -2398,6 +2515,97 @@ pub fn verify_op_sequence_timed_flat(
 mod tests {
     use super::*;
     use crate::mmr_tree::{h_leaf, MmrTree};
+
+    #[test]
+    fn piece_text_edit_wire_value_is_user_sigref_op() {
+        assert_eq!(OpType::Action.as_u8(), 14);
+        assert_eq!(OpType::Noop.as_u8(), 15);
+        assert_eq!(OpType::PieceTextEdit.as_u8(), 16);
+        assert_eq!(OpType::PieceTextCleanupPieces.as_u8(), 17);
+        assert_eq!(OpType::PieceTextCleanupBuffers.as_u8(), 18);
+        assert_eq!(OpType::from_u8(16), Some(OpType::PieceTextEdit));
+        assert_eq!(OpType::from_u8(17), Some(OpType::PieceTextCleanupPieces));
+        assert_eq!(OpType::from_u8(18), Some(OpType::PieceTextCleanupBuffers));
+
+        let mut map = BTreeMap::new();
+        assert!(validate_sigref(&mut map, 7, 0, 1, [0x11; 32]));
+        assert!(validate_sigref(&mut map, 7, 1, 2, [0x22; 32]));
+        assert!(!validate_sigref(&mut map, 7, 0, 3, [0x33; 32]));
+    }
+
+    fn auth_classification_entry(
+        op_type: OpType,
+        uid: u32,
+        sig_ref: u32,
+        signature: Vec<u8>,
+    ) -> ChangelogEntry {
+        ChangelogEntry {
+            timestamp: 1,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type,
+                tree_path: ROOT_TREE_PATH.to_vec(),
+                entries: vec![KvData {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            },
+            sig_ref,
+            parent_clc: [0u8; 32],
+            signature,
+        }
+    }
+
+    #[test]
+    fn piece_text_source_classification_enforces_cleanup_sentinels() {
+        let cleanup_pieces =
+            auth_classification_entry(OpType::PieceTextCleanupPieces, 0, 0, Vec::new());
+        assert_eq!(
+            classify_changelog_entry(&cleanup_pieces).unwrap(),
+            AuthenticationClass::SystemSource
+        );
+
+        let cleanup_buffers =
+            auth_classification_entry(OpType::PieceTextCleanupBuffers, 0, 0, Vec::new());
+        assert_eq!(
+            classify_changelog_entry(&cleanup_buffers).unwrap(),
+            AuthenticationClass::SystemSource
+        );
+
+        let edit = auth_classification_entry(OpType::PieceTextEdit, 7, 3, Vec::new());
+        assert_eq!(
+            classify_changelog_entry(&edit).unwrap(),
+            AuthenticationClass::UserSource
+        );
+
+        let bad_cleanup_uid =
+            auth_classification_entry(OpType::PieceTextCleanupPieces, 7, 0, Vec::new());
+        assert!(classify_changelog_entry(&bad_cleanup_uid)
+            .unwrap_err()
+            .to_string()
+            .contains("uid == 0"));
+
+        let bad_edit_uid = auth_classification_entry(OpType::PieceTextEdit, 0, 0, Vec::new());
+        assert!(classify_changelog_entry(&bad_edit_uid)
+            .unwrap_err()
+            .to_string()
+            .contains("uid 0"));
+    }
+
+    #[test]
+    fn system_source_classification_ignores_signature() {
+        let cleanup_with_sig = auth_classification_entry(
+            OpType::PieceTextCleanupPieces,
+            0,
+            0,
+            b"stray-bytes".to_vec(),
+        );
+        assert_eq!(
+            classify_changelog_entry(&cleanup_with_sig).unwrap(),
+            AuthenticationClass::SystemSource
+        );
+    }
 
     #[test]
     fn changelog_entry_rejects_trailing_bytes_that_change_clc_commitment() {

@@ -60,6 +60,12 @@ pub enum ColumnType {
     /// Ordered list backed by the internal `_lists` table.
     /// Cell value is an i64 `list_number` allocated at insert time.
     List,
+    /// Piece-text document backed by the internal `_piecetext_pieces` table.
+    /// Cell value is an i64 `list_number` allocated at insert time.  Like
+    /// `List`, the parent row stores only the list number; the generic
+    /// insert path writes a placeholder `0`, and the document contents are
+    /// owned by dedicated server-managed piece-text edit operations.
+    PieceText,
     /// Always hashed: Merk stores SHA-256(value), full value lives in HashStore.
     Text,
     /// Always hashed: Merk stores SHA-256(value), full value lives in HashStore.
@@ -123,5 +129,14 @@ mod tests {
 
         let schema: Schema = serde_json::from_str(legacy).expect("legacy JSON should parse");
         assert!(schema.auto_increment);
+    }
+
+    #[test]
+    fn piece_text_column_type_is_not_hash_backed() {
+        // PieceText cells hold a plaintext i64 list_number, like List, so the
+        // column is not hash-backed and is safe to index internally.
+        assert!(!ColumnType::PieceText.is_hash_backed());
+        let json = serde_json::to_value(ColumnType::PieceText).unwrap();
+        assert_eq!(json, serde_json::json!("PieceText"));
     }
 }

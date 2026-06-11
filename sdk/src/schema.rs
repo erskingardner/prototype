@@ -146,9 +146,12 @@ pub struct ColumnBuilder {
 
 impl ColumnBuilder {
     fn new(schema_builder: SchemaBuilder, name: &str, column_type: ColumnType) -> Self {
-        // FileRef and List columns are always plaintext so the server can
-        // read the hash for lifecycle management.
-        let plaintext = matches!(column_type, ColumnType::FileRef | ColumnType::List);
+        // FileRef, List, and PieceText columns are always plaintext so the
+        // server can read their lifecycle or list-number metadata.
+        let plaintext = matches!(
+            column_type,
+            ColumnType::FileRef | ColumnType::List | ColumnType::PieceText
+        );
         Self {
             schema_builder,
             column_def: ColumnDefinition {
@@ -210,7 +213,7 @@ impl ColumnBuilder {
         }
         if matches!(
             self.column_def.column_type,
-            ColumnType::FileRef | ColumnType::List
+            ColumnType::FileRef | ColumnType::List | ColumnType::PieceText
         ) && !self.column_def.plaintext
         {
             return Err(SdkError::ValidationError(format!(
@@ -218,10 +221,14 @@ impl ColumnBuilder {
                 self.column_def.column_type, self.column_def.name,
             )));
         }
-        if matches!(self.column_def.column_type, ColumnType::List) && self.column_def.indexed {
+        if matches!(
+            self.column_def.column_type,
+            ColumnType::List | ColumnType::PieceText
+        ) && self.column_def.indexed
+        {
             return Err(SdkError::ValidationError(format!(
-                "List column '{}' cannot be indexed",
-                self.column_def.name,
+                "{:?} column '{}' cannot be indexed",
+                self.column_def.column_type, self.column_def.name,
             )));
         }
         self.schema_builder.schema.columns.push(self.column_def);
@@ -232,6 +239,55 @@ impl ColumnBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn piece_text_columns_default_to_plaintext() {
+        let schema = SchemaBuilder::new("channels")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("notes_pieces", ColumnType::PieceText)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let col = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "notes_pieces")
+            .unwrap();
+        assert!(col.plaintext);
+        assert!(!col.indexed);
+    }
+
+    #[test]
+    fn piece_text_columns_reject_indexed_true() {
+        let err = SchemaBuilder::new("channels")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("notes_pieces", ColumnType::PieceText)
+            .unwrap()
+            .index()
+            .build()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("PieceText"));
+        assert!(err.to_string().contains("cannot be indexed"));
+    }
+
+    #[test]
+    fn piece_text_columns_reject_encrypted_override() {
+        let err = SchemaBuilder::new("channels")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("notes_pieces", ColumnType::PieceText)
+            .unwrap()
+            .encrypted()
+            .build()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("PieceText"));
+        assert!(err.to_string().contains("must be plaintext"));
+    }
 
     // ---------------------------------------------------------------------
     // SchemaBuilder happy paths

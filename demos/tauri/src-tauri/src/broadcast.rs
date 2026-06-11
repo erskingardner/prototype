@@ -35,8 +35,12 @@ fn is_current_user_removed(evt: &BroadcastEvent, space: &Space) -> bool {
 
 pub fn start_broadcast_listener(app_handle: AppHandle, space: Arc<Space>) {
     let mut rx = space.subscribe_updates();
+    let weak_space = Arc::downgrade(&space);
     tokio::spawn(async move {
         while let Ok(evt) = rx.recv().await {
+            let Some(space) = weak_space.upgrade() else {
+                break;
+            };
             if is_current_user_removed(&evt, &space) {
                 // Clear app state (same cleanup as the logout command)
                 let app_state = app_handle.state::<AppState>();

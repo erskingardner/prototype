@@ -5,8 +5,9 @@
 
 use base64::Engine as _;
 use encrypted_spaces_backend::access_control::AuthContext;
+use encrypted_spaces_backend::merk_storage::stored_value::{bytes_to_value, value_to_bytes};
 use encrypted_spaces_backend::merk_storage::{
-    build_column_kv_vecs, column_key_placeholder, get_row_data_from_query,
+    build_column_kv_vecs, column_key, column_key_placeholder, get_row_data_from_query, Op,
 };
 use encrypted_spaces_backend::query::{Query, QueryOperation, QueryParam};
 use encrypted_spaces_backend::schema::{ColumnDefinition, ColumnType, Schema};
@@ -16,9 +17,23 @@ use encrypted_spaces_backend::SpaceId;
 use encrypted_spaces_backend_server::app_config::{BootstrapDataSource, SpaceInitConfig};
 use encrypted_spaces_backend_server::SpaceState;
 use encrypted_spaces_changelog_core::changelog::{
-    Change, ChangeLog, ChangeResponse, OpType, ROOT_TREE_PATH,
+    Change, ChangeLog, ChangeResponse, ChangelogEntry, HashedValues, LogMessage, OpType,
+    ROOT_TREE_PATH,
+};
+use encrypted_spaces_changelog_core::piece_text::{
+    BufferCoord, InsertedBufferManifest, PieceTextAddress, PieceTextEditEnvelopeV1,
+    PieceTextEditItemManifest, PieceTextEditManifest, PIECE_TEXT_ENVELOPE_VERSION_V1,
+};
+use encrypted_spaces_changelog_core::piece_text_cleanup::{
+    PieceTextCleanupBuffersEnvelopeV1, PieceTextCleanupPiecesEnvelopeV1, PieceTextCleanupRunV1,
+    MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS, PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
 };
 use encrypted_spaces_crypto::signature::{Ed25519Signature, SignatureKeyPair};
+use encrypted_spaces_storage_encoding::keys::{
+    encode_list_parent, index_key, list_parent_key, piece_coords_head_key,
+    piece_coords_next_list_number_key, piece_coords_parent_key, piece_coords_tail_key,
+    row_id_to_bytes, PIECE_COORDS_TABLE,
+};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -182,6 +197,468 @@ pub fn user_registration_query(uid: u32) -> Query {
     )
 }
 
+/// A mixed table (Integer + Text + List + PieceText) used by the PieceText
+/// fast-forward / prover fixtures.
+pub fn mixed_docs_schema() -> Schema {
+    Schema {
+        name: "docs".to_string(),
+        columns: vec![
+            ColumnDefinition {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                plaintext: true,
+                indexed: false,
+            },
+            ColumnDefinition {
+                name: "title".to_string(),
+                column_type: ColumnType::Text,
+                plaintext: true,
+                indexed: false,
+            },
+            ColumnDefinition {
+                name: "items".to_string(),
+                column_type: ColumnType::List,
+                plaintext: true,
+                indexed: false,
+            },
+            ColumnDefinition {
+                name: "body".to_string(),
+                column_type: ColumnType::PieceText,
+                plaintext: true,
+                indexed: false,
+            },
+        ],
+        auto_increment: false,
+    }
+}
+
+/// Identifies a PieceText parent cell in fixtures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PieceTextFixtureAddress {
+    pub table: String,
+    pub row_id: i64,
+    pub column: String,
+}
+
+/// Read a stored integer cell `(table, row_id, column)` from server state.
+pub fn read_i64_cell(state: &SpaceState, table: &str, row_id: i64, column: &str) -> i64 {
+    let bytes = state
+        .db
+        .get_value(&column_key(table, row_id, column))
+        .unwrap()
+        .unwrap_or_else(|| panic!("missing cell {table}.{column} at row {row_id}"));
+    bytes_to_value(&bytes).unwrap().as_i64().unwrap()
+}
+
+fn stored_json(value: serde_json::Value) -> Vec<u8> {
+    value_to_bytes(&value).expect("test stored value serialization")
+}
+
+fn put_test_key_value(state: &mut SpaceState, key: Vec<u8>, value: Vec<u8>) {
+    state
+        .db
+        .apply_batch_ops(vec![(key, Op::Put(value))])
+        .unwrap();
+}
+
+/// Insert a `docs` row with a list column and a PieceText parent cell, then
+/// seed the PieceText head/tail/parent metadata so edits can be applied.
+pub async fn prepare_piece_text_docs_setup(
+    state: &mut SpaceState,
+) -> (i64, PieceTextFixtureAddress) {
+    let setup_auth = AuthContext::new(None, state.space_id);
+    let row_id = 1i64;
+    state
+        .db
+        .insert(
+            Query::new(
+                "docs".to_string(),
+                QueryOperation::Insert(vec![
+                    ("id".to_string(), QueryParam::Integer(row_id)),
+                    ("title".to_string(), QueryParam::Text("doc".to_string())),
+                    ("items".to_string(), QueryParam::Integer(0)),
+                    ("body".to_string(), QueryParam::Integer(0)),
+                ]),
+            ),
+            &setup_auth,
+        )
+        .await
+        .unwrap();
+
+    let items_list_number = read_i64_cell(state, "docs", row_id, "items");
+    put_test_key_value(
+        state,
+        list_parent_key(items_list_number),
+        encode_list_parent("docs", row_id, "items"),
+    );
+
+    let address = PieceTextFixtureAddress {
+        table: "docs".to_string(),
+        row_id,
+        column: "body".to_string(),
+    };
+
+    let piece_text_list_number = 1i64;
+    put_test_key_value(
+        state,
+        column_key(&address.table, address.row_id, &address.column),
+        stored_json(serde_json::json!(piece_text_list_number)),
+    );
+    put_test_key_value(
+        state,
+        piece_coords_head_key(piece_text_list_number),
+        0i64.to_be_bytes().to_vec(),
+    );
+    put_test_key_value(
+        state,
+        piece_coords_tail_key(piece_text_list_number),
+        0i64.to_be_bytes().to_vec(),
+    );
+    put_test_key_value(
+        state,
+        piece_coords_parent_key(piece_text_list_number),
+        encode_list_parent(&address.table, address.row_id, &address.column),
+    );
+    put_test_key_value(
+        state,
+        piece_coords_next_list_number_key(),
+        (piece_text_list_number + 1).to_be_bytes().to_vec(),
+    );
+
+    (items_list_number, address)
+}
+
+/// Re-start the changelog at the post-setup root and refresh the snapshot.
+pub async fn reset_changelog_after_setup(state: &mut SpaceState) -> merk::Node {
+    state.reinitialize_changelog().await.unwrap();
+    state.ff_proof = None;
+    state.tree_snapshot = state.db.snapshot();
+    state
+        .tree_snapshot
+        .clone()
+        .expect("setup tree snapshot should exist")
+}
+
+/// Convert a fixture address into the verifier's `PieceTextAddress`.
+fn piece_text_address(addr: &PieceTextFixtureAddress) -> PieceTextAddress {
+    PieceTextAddress {
+        table: addr.table.clone(),
+        row_id: addr.row_id,
+        column: addr.column.clone(),
+    }
+}
+
+/// Content-address hash for a hash-backed value.
+fn content_value_hash(body: &[u8]) -> [u8; 32] {
+    encrypted_spaces_storage_encoding::hashstore_hash(body)
+}
+
+/// Build, sign, and apply a `Change` through `handle_change`.
+async fn submit_signed_change(
+    state: &mut SpaceState,
+    auth: &AuthContext,
+    op_type: OpType,
+    keys: Vec<Vec<u8>>,
+    values: Vec<Vec<u8>>,
+    hashed_values: HashedValues,
+) {
+    let uid = auth.uid.unwrap() as u32;
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let val_refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
+    let cc = state.changelog.num_changes();
+    let mut change = Change::new(
+        op_type,
+        uid,
+        ROOT_TREE_PATH,
+        &key_refs,
+        &val_refs,
+        cc,
+        cc,
+        state.changelog.current_root(),
+    )
+    .unwrap();
+    change.hashed_values = hashed_values;
+    sign_test_change(uid, &mut change);
+    state.handle_change(&change, auth).await.unwrap();
+}
+
+/// Apply a normal product-table insert as a tracked change.
+async fn submit_product_insert(state: &mut SpaceState, auth: &AuthContext, name: &str, price: f64) {
+    let query = Query::new(
+        "products".to_string(),
+        QueryOperation::Insert(vec![
+            ("id".to_string(), QueryParam::Integer(0)),
+            ("name".to_string(), QueryParam::Text(name.to_string())),
+            ("price".to_string(), QueryParam::Real(price)),
+        ]),
+    );
+    let (_, column_data) = get_row_data_from_query(&query).unwrap();
+    let (col_keys, col_values) =
+        build_column_kv_vecs(&column_data, |col| column_key_placeholder("products", col));
+    submit_signed_change(
+        state,
+        auth,
+        OpType::Insert,
+        col_keys,
+        col_values,
+        HashedValues::new(),
+    )
+    .await;
+}
+
+/// Apply a generic `_lists` append as a tracked change.
+async fn submit_list_append(
+    state: &mut SpaceState,
+    auth: &AuthContext,
+    list_number: i64,
+    value: &str,
+) {
+    let full_value = value_to_bytes(&serde_json::Value::String(value.to_string())).unwrap();
+    let value_hash = content_value_hash(&full_value);
+    let keys = vec![
+        column_key_placeholder("_lists", "list_number"),
+        column_key_placeholder("_lists", "value"),
+    ];
+    let values = vec![
+        value_to_bytes(&serde_json::json!(list_number)).unwrap(),
+        value_hash.to_vec(),
+    ];
+    let mut hashed_values = HashedValues::new();
+    hashed_values.insert(value_hash, full_value);
+    submit_signed_change(state, auth, OpType::ListAppend, keys, values, hashed_values).await;
+}
+
+/// Apply an already-built `Change` directly through the native prover.
+async fn apply_change_directly(state: &mut SpaceState, change: Change, current_change_id: usize) {
+    let old_root = state.db.root_hash();
+    let pruned_merkle_tree = state
+        .db
+        .apply_change_with_pruned_tree(&change, current_change_id)
+        .await
+        .unwrap();
+    let new_root = state.db.root_hash();
+    let change_id = state
+        .changelog
+        .add_change(&change.entry, &pruned_merkle_tree, &old_root, &new_root)
+        .unwrap();
+    state.change_responses.push(ChangeResponse {
+        old_root,
+        new_root,
+        pruned_merkle_tree,
+        change_id,
+        rows_affected: 1,
+        accepted_at_server_time: change.entry.timestamp,
+        hashed_values: HashedValues::new(),
+    });
+}
+
+/// Build, sign, and apply a `PieceTextEdit` change directly through the prover.
+async fn submit_piece_text_edit(state: &mut SpaceState, auth: &AuthContext, message: LogMessage) {
+    let uid = auth.uid.unwrap() as u32;
+    let cc = state.changelog.num_changes();
+    let current_change_id = cc as usize + 1;
+    let entry = ChangelogEntry {
+        timestamp: ChangelogEntry::get_unix_timestamp(),
+        uid,
+        parent_change: cc,
+        message,
+        sig_ref: cc,
+        parent_clc: state.changelog.current_root(),
+        signature: vec![],
+    };
+    let mut change = Change {
+        entry,
+        hashed_values: HashedValues::new(),
+    };
+    sign_test_change(uid, &mut change);
+    apply_change_directly(state, change, current_change_id).await;
+}
+
+/// Append `text` at `at` as a single-insert `PieceTextEdit` (UTF-32LE bodies).
+async fn submit_piece_text_append(
+    state: &mut SpaceState,
+    auth: &AuthContext,
+    address: &PieceTextAddress,
+    at: BufferCoord,
+    text: &str,
+    op_id_seed: u128,
+) {
+    let body: Vec<u8> = text
+        .chars()
+        .flat_map(|c| (c as u32).to_le_bytes())
+        .collect();
+    let envelope = PieceTextEditEnvelopeV1 {
+        version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+        op_id: op_id_seed.to_be_bytes(),
+        address: address.clone(),
+        edit: PieceTextEditManifest {
+            ops: vec![PieceTextEditItemManifest::Insert {
+                at,
+                inserted: InsertedBufferManifest {
+                    len_bytes: body.len() as u32,
+                    ciphertext_len: body.len() as u32,
+                    ciphertext_value_hash: content_value_hash(&body),
+                },
+            }],
+        },
+    };
+    submit_piece_text_edit(state, auth, envelope.changelog_message().unwrap()).await;
+}
+
+/// Tombstone the `[start, end)` span as a single-delete `PieceTextEdit`.
+async fn submit_piece_text_delete(
+    state: &mut SpaceState,
+    auth: &AuthContext,
+    address: &PieceTextAddress,
+    start: BufferCoord,
+    end: BufferCoord,
+    op_id_seed: u128,
+) {
+    let envelope = PieceTextEditEnvelopeV1 {
+        version: PIECE_TEXT_ENVELOPE_VERSION_V1,
+        op_id: op_id_seed.to_be_bytes(),
+        address: address.clone(),
+        edit: PieceTextEditManifest {
+            ops: vec![PieceTextEditItemManifest::Delete { start, end }],
+        },
+    };
+    submit_piece_text_edit(state, auth, envelope.changelog_message().unwrap()).await;
+}
+
+/// Apply a system-source `PieceTextCleanupPieces` (uid 0) directly through the
+/// prover. `op_id` is set to the current change id, as the verifier requires.
+async fn submit_piece_text_cleanup_pieces(
+    state: &mut SpaceState,
+    address: &PieceTextAddress,
+    list_number: i64,
+    runs: Vec<PieceTextCleanupRunV1>,
+) {
+    let current_change_id = state.changelog.num_changes() as usize + 1;
+    let envelope = PieceTextCleanupPiecesEnvelopeV1 {
+        version: PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+        address: address.clone(),
+        list_number,
+        op_id: current_change_id as i64,
+        runs,
+    };
+    apply_system_cleanup_change(
+        state,
+        envelope.changelog_message().unwrap(),
+        current_change_id,
+    )
+    .await;
+}
+
+/// Apply a system-source `PieceTextCleanupBuffers` (uid 0) directly through the
+/// prover. `op_id` is set to the current change id, as the verifier requires.
+async fn submit_piece_text_cleanup_buffers(
+    state: &mut SpaceState,
+    address: &PieceTextAddress,
+    buffer_removals: Vec<i64>,
+) {
+    let current_change_id = state.changelog.num_changes() as usize + 1;
+    let envelope = PieceTextCleanupBuffersEnvelopeV1 {
+        version: PIECE_TEXT_CLEANUP_ENVELOPE_VERSION_V1,
+        address: address.clone(),
+        op_id: current_change_id as i64,
+        buffer_removals,
+    };
+    apply_system_cleanup_change(
+        state,
+        envelope.changelog_message().unwrap(),
+        current_change_id,
+    )
+    .await;
+}
+
+/// Build an unsigned system-source changelog entry (uid 0, sig_ref 0) for a
+/// cleanup `LogMessage` and apply it through the native prover.
+async fn apply_system_cleanup_change(
+    state: &mut SpaceState,
+    message: LogMessage,
+    current_change_id: usize,
+) {
+    let entry = ChangelogEntry {
+        timestamp: ChangelogEntry::get_unix_timestamp(),
+        uid: 0,
+        parent_change: state.changelog.num_changes(),
+        message,
+        sig_ref: 0,
+        parent_clc: state.changelog.current_root(),
+        signature: vec![],
+    };
+    let change = Change {
+        entry,
+        hashed_values: HashedValues::new(),
+    };
+    apply_change_directly(state, change, current_change_id).await;
+}
+
+/// Seed a fully-tombstoned `_piecetext_pieces` chain of `n_rows` rows (ids `1..=n`)
+/// directly into the post-setup tree, every row referencing `buffer_id`, and
+/// point the document head/tail at the chain ends. Used by the cleanup stress
+/// fixture to build a worst-case (every row tombstoned) document without paying
+/// for thousands of real `PieceTextEdit`s. Each row carries the seven
+/// `_piecetext_pieces` columns plus its `list_number` and `buffer_id` index entries —
+/// exactly what `PieceTextCleanupPieces` authenticates and deletes per row.
+fn seed_tombstoned_piece_chain(
+    state: &mut SpaceState,
+    list_number: i64,
+    buffer_id: i64,
+    n_rows: i64,
+) {
+    const PIECE_LEN_BYTES: i64 = 4; // one UTF-32 scalar, satisfies alignment
+    let mut ops: Vec<(Vec<u8>, Op)> = Vec::with_capacity(n_rows as usize * 9 + 2);
+    for row_id in 1..=n_rows {
+        let prev_id = if row_id == 1 { 0 } else { row_id - 1 };
+        let next_id = if row_id == n_rows { 0 } else { row_id + 1 };
+        let start_byte = (row_id - 1) * PIECE_LEN_BYTES;
+        for (column, value) in [
+            ("list_number", list_number),
+            ("prev_id", prev_id),
+            ("next_id", next_id),
+            ("buffer_id", buffer_id),
+            ("start_byte", start_byte),
+            ("len_bytes", PIECE_LEN_BYTES),
+            ("tombstone", 1),
+        ] {
+            ops.push((
+                column_key(PIECE_COORDS_TABLE, row_id, column),
+                Op::Put(stored_json(serde_json::json!(value))),
+            ));
+        }
+        ops.push((
+            index_key(PIECE_COORDS_TABLE, "list_number", list_number, row_id).unwrap(),
+            Op::Put(row_id_to_bytes(row_id).to_vec()),
+        ));
+        ops.push((
+            index_key(PIECE_COORDS_TABLE, "buffer_id", buffer_id, row_id).unwrap(),
+            Op::Put(row_id_to_bytes(row_id).to_vec()),
+        ));
+    }
+    ops.push((
+        piece_coords_head_key(list_number),
+        Op::Put(1i64.to_be_bytes().to_vec()),
+    ));
+    ops.push((
+        piece_coords_tail_key(list_number),
+        Op::Put(n_rows.to_be_bytes().to_vec()),
+    ));
+    state.db.apply_batch_ops(ops).unwrap();
+}
+
+/// Read a big-endian i64 stored directly under `key` (e.g. a head/tail pointer).
+pub fn read_be_i64_key(state: &SpaceState, key: Vec<u8>) -> i64 {
+    let bytes = state
+        .db
+        .get_value(&key)
+        .unwrap()
+        .unwrap_or_else(|| panic!("missing i64 key {key:?}"));
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes);
+    i64::from_be_bytes(buf)
+}
+
 pub struct TestServer {
     state: SpaceState,
     /// Snapshot of the tree before changes were applied (needed for batch proof generation)
@@ -205,6 +682,195 @@ impl TestServer {
     pub fn update_tree_snapshot(&mut self) {
         self.tree_snapshot = self.state.db.snapshot();
     }
+
+    /// A mixed history: a normal table insert, a generic `_lists` append, and
+    /// two signed `PieceTextEdit` appends. Used to prove PieceTextEdit verifies
+    /// through the FF core alongside other op types.
+    pub async fn new_mixed_table_list_piece_text_history() -> Self {
+        let mut state = init_test_server_state_with_schema(
+            None,
+            &[TEST_CLIENT_UID],
+            vec![products_schema(), mixed_docs_schema()],
+        )
+        .await;
+        let (items_list_number, fixture_address) = prepare_piece_text_docs_setup(&mut state).await;
+        let address = piece_text_address(&fixture_address);
+        let tree_snapshot = reset_changelog_after_setup(&mut state).await;
+        let auth = AuthContext::new(Some(TEST_CLIENT_UID as i64), state.space_id);
+
+        submit_product_insert(&mut state, &auth, "Mixed", 9.0).await;
+        submit_list_append(&mut state, &auth, items_list_number, "item-1").await;
+        submit_piece_text_append(
+            &mut state,
+            &auth,
+            &address,
+            BufferCoord::DOCUMENT_START,
+            "one",
+            1,
+        )
+        .await;
+        submit_piece_text_append(
+            &mut state,
+            &auth,
+            &address,
+            BufferCoord {
+                buffer_id: 1,
+                byte_pos: 12, // 3 scalars × 4 UTF-32 bytes
+            },
+            "two",
+            2,
+        )
+        .await;
+
+        Self {
+            state,
+            tree_snapshot: Some(tree_snapshot),
+            user_uid: TEST_CLIENT_UID,
+        }
+    }
+
+    /// A mixed cleanup history exercising both split cleanup ops end to end:
+    /// two signed `PieceTextEdit` appends ("alpha", then "beta"), a signed
+    /// `PieceTextEdit` delete that tombstones the "alpha" piece, then a
+    /// system-source `PieceTextCleanupPieces` that splices out the tombstoned
+    /// row (head run, relinking the survivor as the new head) and finally a
+    /// system-source `PieceTextCleanupBuffers` that deletes the now-orphaned
+    /// "alpha" buffer once its `_piecetext_pieces.buffer_id` index range is empty.
+    /// Used to prove a `PieceTextEdit` + `PieceTextCleanupPieces` +
+    /// `PieceTextCleanupBuffers` history verifies through the FF core and that
+    /// each cleanup op's per-change proof stays within budget.
+    pub async fn new_piece_text_cleanup_history() -> Self {
+        let mut state = init_test_server_state_with_schema(
+            None,
+            &[TEST_CLIENT_UID],
+            vec![products_schema(), mixed_docs_schema()],
+        )
+        .await;
+        let (_items_list_number, fixture_address) = prepare_piece_text_docs_setup(&mut state).await;
+        let address = piece_text_address(&fixture_address);
+        let tree_snapshot = reset_changelog_after_setup(&mut state).await;
+        let auth = AuthContext::new(Some(TEST_CLIENT_UID as i64), state.space_id);
+
+        // "alpha" (5 scalars → 20 UTF-32 bytes) lands in buffer 1 / piece P1.
+        submit_piece_text_append(
+            &mut state,
+            &auth,
+            &address,
+            BufferCoord::DOCUMENT_START,
+            "alpha",
+            30_000,
+        )
+        .await;
+        // "beta" appended at the end lands in buffer 2 / piece P2 (the survivor).
+        submit_piece_text_append(
+            &mut state,
+            &auth,
+            &address,
+            BufferCoord {
+                buffer_id: 1,
+                byte_pos: 20,
+            },
+            "beta",
+            30_001,
+        )
+        .await;
+
+        let list_number = read_i64_cell(&state, &address.table, address.row_id, &address.column);
+        let alpha_piece = read_be_i64_key(&state, piece_coords_head_key(list_number));
+        let alpha_buffer = read_i64_cell(&state, PIECE_COORDS_TABLE, alpha_piece, "buffer_id");
+        let alpha_len = read_i64_cell(&state, PIECE_COORDS_TABLE, alpha_piece, "len_bytes") as u32;
+
+        // Tombstone the whole "alpha" span — a full-piece delete leaves P1 in the
+        // chain (head, pointing at P2) with `tombstone = true`.
+        submit_piece_text_delete(
+            &mut state,
+            &auth,
+            &address,
+            BufferCoord {
+                buffer_id: alpha_buffer,
+                byte_pos: 0,
+            },
+            BufferCoord {
+                buffer_id: alpha_buffer,
+                byte_pos: alpha_len,
+            },
+            30_002,
+        )
+        .await;
+
+        // Piece cleanup: a single head run splices out P1 (prev_survivor 0 → list
+        // head) and relinks P2 as the new head.
+        submit_piece_text_cleanup_pieces(
+            &mut state,
+            &address,
+            list_number,
+            vec![PieceTextCleanupRunV1 {
+                removals: vec![alpha_piece],
+            }],
+        )
+        .await;
+
+        // Buffer cleanup: "alpha"'s buffer is now unreferenced (P1 gone, P2 uses
+        // buffer 2), so its `buffer_id` index range is empty and it is deletable.
+        submit_piece_text_cleanup_buffers(&mut state, &address, vec![alpha_buffer]).await;
+
+        Self {
+            state,
+            tree_snapshot: Some(tree_snapshot),
+            user_uid: TEST_CLIENT_UID,
+        }
+    }
+
+    /// A worst-case piece-cleanup stress history: a fully-tombstoned `n_rows`-row
+    /// document drained by back-to-back `PieceTextCleanupPieces` chunks of up to
+    /// `MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS` removals each. The synthetic chain
+    /// is seeded into the pre-history tree, so the whole verified range is just
+    /// the cleanup chunks. Every chunk removes a contiguous prefix run, so the
+    /// optimized verifier touches only its own removed rows plus one boundary
+    /// survivor — never the whole list. Used to measure that optimized cleanup
+    /// `_piecetext_pieces` row visits stay far below the legacy
+    /// whole-list-per-chunk shape.
+    pub async fn new_piece_text_cleanup_pieces_stress_history(n_rows: usize) -> Self {
+        let mut state = init_test_server_state_with_schema(
+            None,
+            &[TEST_CLIENT_UID],
+            vec![products_schema(), mixed_docs_schema()],
+        )
+        .await;
+        let (_items_list_number, fixture_address) = prepare_piece_text_docs_setup(&mut state).await;
+        let address = piece_text_address(&fixture_address);
+        let list_number = read_i64_cell(&state, &address.table, address.row_id, &address.column);
+        let buffer_id = 1i64;
+        let n = n_rows as i64;
+        seed_tombstoned_piece_chain(&mut state, list_number, buffer_id, n);
+        let tree_snapshot = reset_changelog_after_setup(&mut state).await;
+
+        // Drain the chain from the front: each chunk removes the current head run
+        // of up to the removal cap, relinking the next survivor as the new head
+        // (or zeroing head/tail on the final remove-all chunk).
+        let cap = MAX_PIECE_TEXT_CLEANUP_PIECE_REMOVALS as i64;
+        let mut start = 1i64;
+        while start <= n {
+            let end = (start + cap - 1).min(n);
+            submit_piece_text_cleanup_pieces(
+                &mut state,
+                &address,
+                list_number,
+                vec![PieceTextCleanupRunV1 {
+                    removals: (start..=end).collect(),
+                }],
+            )
+            .await;
+            start = end + 1;
+        }
+
+        Self {
+            state,
+            tree_snapshot: Some(tree_snapshot),
+            user_uid: TEST_CLIENT_UID,
+        }
+    }
+
     /// Creates a new ChangeLog with the specified number of test changes.
     ///
     /// # Arguments

@@ -499,6 +499,7 @@ fn parse_column_node(node: &KdlNode, table_name: &str) -> Result<ColumnDefinitio
         "blob" => ColumnType::Blob,
         "fileref" => ColumnType::FileRef,
         "list" => ColumnType::List,
+        "piecetext" => ColumnType::PieceText,
         other => {
             return Err(SdkError::SchemaParsingError(format!(
                 "table \"{table_name}\" column \"{name}\": unknown type '{other}'"
@@ -507,13 +508,29 @@ fn parse_column_node(node: &KdlNode, table_name: &str) -> Result<ColumnDefinitio
     };
     let plaintext = bool_attr(node, "plaintext")?.unwrap_or(matches!(
         column_type,
-        ColumnType::FileRef | ColumnType::List
+        ColumnType::FileRef | ColumnType::List | ColumnType::PieceText
     ));
     let indexed = bool_attr(node, "indexed")?.unwrap_or(false);
     if column_type.is_hash_backed() && indexed {
         return Err(SdkError::SchemaParsingError(format!(
             "table \"{table_name}\" column \"{name}\": hash-backed columns cannot be indexed"
         )));
+    }
+    // PieceText cells hold a server-managed i64 list_number written as a
+    // placeholder `0` on insert.  They are always stored in plaintext (the
+    // server reads the list number for document lifecycle) and can never be
+    // indexed, since the cell value is an allocation handle, not user data.
+    if matches!(column_type, ColumnType::PieceText) {
+        if indexed {
+            return Err(SdkError::SchemaParsingError(format!(
+                "table \"{table_name}\" column \"{name}\": PieceText columns cannot be indexed"
+            )));
+        }
+        if !plaintext {
+            return Err(SdkError::SchemaParsingError(format!(
+                "table \"{table_name}\" column \"{name}\": PieceText columns must be plaintext"
+            )));
+        }
     }
     Ok(ColumnDefinition {
         name,
@@ -1320,6 +1337,52 @@ mod tests {
         let err = parse_schema_bundle(kdl).unwrap_err().to_string();
         assert!(
             err.contains("hash-backed columns cannot be referenced by action \"delete_message\" cascade_delete self predicate"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_piecetext_column_defaults_to_plaintext_not_indexed() {
+        let kdl = r#"
+            table "channels" {
+                column "id" type="int" plaintext=#true
+                column "notes_pieces" type="piecetext"
+            }
+        "#;
+        let bundle = parse_schema_bundle(kdl).unwrap();
+        let schema = bundle.tables[0].schema.as_ref().unwrap();
+        let col = &schema.columns[1];
+        assert_eq!(col.column_type, ColumnType::PieceText);
+        assert!(col.plaintext, "PieceText columns default to plaintext");
+        assert!(!col.indexed, "PieceText columns are not indexed");
+    }
+
+    #[test]
+    fn rejects_indexed_piecetext() {
+        let kdl = r#"
+            table "channels" {
+                column "id" type="int" plaintext=#true
+                column "notes_pieces" type="piecetext" indexed=#true
+            }
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(
+            err.contains("PieceText columns cannot be indexed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_encrypted_piecetext() {
+        let kdl = r#"
+            table "channels" {
+                column "id" type="int" plaintext=#true
+                column "notes_pieces" type="piecetext" plaintext=#false
+            }
+        "#;
+        let err = parse_schema_bundle(kdl).unwrap_err().to_string();
+        assert!(
+            err.contains("PieceText columns must be plaintext"),
             "got: {err}"
         );
     }

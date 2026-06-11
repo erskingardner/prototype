@@ -10,7 +10,7 @@ table "channels" {
     column "name"        type="text"
     column "description" type="text"
     column "tasks"       type="list"
-    column "notes"       type="list"
+    column "notes"       type="piecetext"
 }
 
 table "messages" {

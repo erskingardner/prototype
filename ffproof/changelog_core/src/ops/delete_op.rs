@@ -1,8 +1,9 @@
 use super::{
     column_keys_from_entry, evaluate_acl, make_index_delete, read_acl_rule, read_columns_from_tree,
-    read_schema_columns, read_schema_indexes, table_from_column_keys, validate_max_entries,
-    validate_not_internal_table, validate_sorted_entries, validate_user_access, AclCheck,
-    OpContext, OpReader, OpVerifier, OpVerifyResult,
+    read_schema_columns, read_schema_indexes, read_schema_piece_text_columns,
+    table_from_column_keys, validate_max_entries, validate_not_internal_table,
+    validate_sorted_entries, validate_user_access, AclCheck, OpContext, OpReader, OpVerifier,
+    OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, ReadOp, TraceStep};
@@ -45,6 +46,22 @@ impl OpVerifier for DeleteOp {
                      deletes must cover all columns"
                 )));
             }
+        }
+
+        // Security decision #2: block parent-row deletion for any table that
+        // declares PieceText columns. A PieceText cell owns a `_piecetext_pieces`
+        // buffer plus its head/tail/parent metadata and any `_piecetext_buffers`
+        // contents; deleting the parent row without cascading those leaves
+        // dangling buffers and breaks the PieceTextEdit parent-key proof.
+        // Until a cascade cleanup/proof story exists, deletes on such tables
+        // are rejected outright.
+        let piece_text_cols = read_schema_piece_text_columns(&table, reader, ctx)?;
+        if !piece_text_cols.is_empty() {
+            return Err(ChangelogError::Generic(format!(
+                "delete: table '{table}' has PieceText column(s) {piece_text_cols:?} — \
+                 deleting rows with PieceText columns is not supported \
+                 (no cascade cleanup for the backing buffers)"
+            )));
         }
 
         let acl = read_acl_rule(reader, &table, "delete", ctx)?.map(|rule| {
@@ -103,12 +120,24 @@ mod tests {
     use crate::{ProvenRead, ReadOp};
     use encrypted_spaces_storage_encoding::keys::{
         acl_rule_key, column_key, schema_columns_key, schema_indexes_key,
+        schema_piece_text_columns_key,
     };
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
 
     /// Compact column-names value for table "t" with columns name, age.
     fn schema_columns_value() -> Vec<u8> {
         b"age\0name".to_vec()
+    }
+
+    /// Proven-read for `schema_piece_text_columns_key(table)` resolving to
+    /// "no PieceText columns" (absent key). The verifier reads the PieceText
+    /// column set right after the schema columns to enforce the parent-row
+    /// delete block (security decision #2).
+    fn pt_columns_absent_read(table: &str) -> ProvenRead {
+        ProvenRead {
+            op: ReadOp::Key(schema_piece_text_columns_key(table)),
+            results: vec![],
+        }
     }
 
     fn user_status_key(uid: u32) -> Vec<u8> {
@@ -151,6 +180,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key(table)),
                 results: vec![(schema_columns_key(table), schema_columns_value())],
             },
+            pt_columns_absent_read(table),
             no_acl_rule_read(table, "delete"),
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key(table)),
@@ -208,6 +238,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("t")),
                 results: vec![(schema_columns_key("t"), schema_one_col)],
             },
+            pt_columns_absent_read("t"),
             no_acl_rule_read("t", "delete"),
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key("t")),
@@ -287,6 +318,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("t")),
                 results: vec![(schema_columns_key("t"), schema_one_col)],
             },
+            pt_columns_absent_read("t"),
             no_acl_rule_read("t", "delete"),
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key("t")),
@@ -345,6 +377,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("t")),
                 results: vec![(schema_columns_key("t"), schema_one_col)],
             },
+            pt_columns_absent_read("t"),
             no_acl_rule_read("t", "delete"),
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key("t")),
@@ -584,6 +617,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("posts")),
                 results: vec![(schema_columns_key("posts"), b"author_id".to_vec())],
             },
+            pt_columns_absent_read("posts"),
             acl_rule_read("posts", "delete", &rule),
             // existing author_id from tree — owned by uid 42
             ProvenRead {
@@ -645,6 +679,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("posts")),
                 results: vec![(schema_columns_key("posts"), b"name".to_vec())],
             },
+            pt_columns_absent_read("posts"),
             acl_rule_read("posts", "delete", &rule),
             ProvenRead {
                 op: ReadOp::Key(schema_indexes_key("posts")),
@@ -696,6 +731,7 @@ mod tests {
                 op: ReadOp::Key(schema_columns_key("posts")),
                 results: vec![(schema_columns_key("posts"), b"name".to_vec())],
             },
+            pt_columns_absent_read("posts"),
             acl_rule_read("posts", "delete", &rule),
         ];
         let ctx = OpContext {
@@ -711,5 +747,67 @@ mod tests {
             msg.contains("ACL denied: delete"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// Security decision #2: deleting a row in a table that declares a
+    /// PieceText column is rejected outright — there is no cascade cleanup
+    /// for the backing `_piecetext_pieces`/`_piecetext_buffers` state, so the verifier
+    /// blocks the delete after confirming column coverage.
+    #[test]
+    fn test_delete_op_rejects_piece_text_table() {
+        // Full-row delete of "docs" row 1, columns body + title (sorted).
+        let body = column_key("docs", 1, "body");
+        let title = column_key("docs", 1, "title");
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid: 1,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::Delete,
+                tree_path: vec![],
+                entries: vec![
+                    KvData {
+                        key: body,
+                        value: vec![],
+                    },
+                    KvData {
+                        key: title,
+                        value: vec![],
+                    },
+                ],
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+        let sk = user_status_key(1);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_columns_key("docs")),
+                results: vec![(schema_columns_key("docs"), b"body\0title".to_vec())],
+            },
+            // "body" is a PieceText column → delete must be blocked.
+            ProvenRead {
+                op: ReadOp::Key(schema_piece_text_columns_key("docs")),
+                results: vec![(schema_piece_text_columns_key("docs"), b"body".to_vec())],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = DeleteOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::OpContext {
+                current_change_id: 0,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("PieceText column"), "unexpected error: {msg}");
+        assert!(msg.contains("docs"), "unexpected error: {msg}");
     }
 }

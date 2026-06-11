@@ -38,6 +38,7 @@ pub fn format_schema(schema: &Schema) -> String {
                 ColumnType::Real => "Real",
                 ColumnType::FileRef => "File",
                 ColumnType::List => "List",
+                ColumnType::PieceText => "PieceText",
                 ColumnType::Text => "Text",
                 ColumnType::Blob => "Blob",
             };

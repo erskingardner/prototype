@@ -25,7 +25,7 @@ fn encrypted_columns_from_schema(schema: &Schema) -> Vec<EncryptedColumn> {
                 ColumnType::String | ColumnType::Text => FieldType::Text,
                 ColumnType::Blob => FieldType::Blob,
                 ColumnType::FileRef => FieldType::FileRef,
-                ColumnType::List => FieldType::List,
+                ColumnType::List | ColumnType::PieceText => FieldType::List,
             },
         })
         .collect()
@@ -155,6 +155,45 @@ pub(crate) async fn decrypt_table_rows(
         decrypted.push(row);
     }
     *rows = decrypted;
+    Ok(())
+}
+
+pub(crate) async fn decrypt_table_rows_strict(
+    rows: &mut [serde_json::Value],
+    table_name: &str,
+    schemas: &HashMap<String, Schema>,
+    space: &Space,
+) -> Result<()> {
+    let table_key = table_name.split(" as ").next().unwrap_or(table_name);
+    let schema = match schemas.get(table_key) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let columns = encrypted_columns_from_schema(schema);
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let km = space.key_manager.lock().await;
+    let builder = space.retention_builder();
+    let resolver = |key_id: encrypted_spaces_key_manager::SimpleKeyId| {
+        let km = &km;
+        let builder = &builder;
+        async move {
+            km.data_key_for_key_id(&key_id, builder)
+                .await
+                .map(|bytes| EncryptionKey::new(bytes, &key_id))
+                .map_err(|_| EncryptionError::MissingKey(format!("{key_id:?}").into_bytes()))
+        }
+    };
+    for row in rows.iter_mut() {
+        if let serde_json::Value::Object(ref mut obj) = row {
+            decrypt_row(obj, &columns, &resolver).await.map_err(|e| {
+                SdkError::DecryptionError(format!(
+                    "strict decrypt failed for table '{table_name}': {e}"
+                ))
+            })?;
+        }
+    }
     Ok(())
 }
 

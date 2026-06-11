@@ -14,6 +14,8 @@ pub const ACCESS_CONTROL_TABLE_NAME: &str = "_access_control";
 pub const KEY_HISTORY_TABLE_NAME: &str = "_key_history";
 pub const RETENTION_TABLE_NAME: &str = "_retention";
 pub const LISTS_TABLE_NAME: &str = "_lists";
+pub const PIECE_COORDS_TABLE_NAME: &str = "_piecetext_pieces";
+pub const BUFFERS_TABLE_NAME: &str = "_piecetext_buffers";
 
 // Column names for the `_key_history` table.
 pub const KEY_HISTORY_COL_UID: &str = "uid";
@@ -68,12 +70,33 @@ pub fn lists_schema() -> Schema {
     schema_named(LISTS_TABLE_NAME)
 }
 
+/// Returns the canonical schema for the `_piecetext_pieces` internal table.
+///
+/// Stores cleartext piece coordinates for `ColumnType::PieceText`
+/// documents.  The `buffer_id` index is the authenticated lookup path
+/// used by the piece-text verifier to resolve persistent byte
+/// coordinates.
+pub fn piece_coords_schema() -> Schema {
+    schema_named(PIECE_COORDS_TABLE_NAME)
+}
+
+/// Returns the canonical schema for the `_piecetext_buffers` internal table.
+///
+/// Stores encrypted buffer bodies plus cleartext owner metadata.
+/// Ordinary app insert/update/delete paths reject this internal table;
+/// `PieceTextEdit` is the only intended mutation path.
+pub fn buffers_schema() -> Schema {
+    schema_named(BUFFERS_TABLE_NAME)
+}
+
 /// Returns all internal table schemas in creation order.
 pub fn all_internal_schemas() -> Vec<Schema> {
     vec![
         access_control_schema(),
+        buffers_schema(),
         key_history_schema(),
         lists_schema(),
+        piece_coords_schema(),
         retention_schema(),
         users_schema(),
     ]
@@ -106,9 +129,11 @@ mod tests {
         assert!(names.contains(&KEY_HISTORY_TABLE_NAME));
         assert!(names.contains(&RETENTION_TABLE_NAME));
         assert!(names.contains(&LISTS_TABLE_NAME));
+        assert!(names.contains(&PIECE_COORDS_TABLE_NAME));
+        assert!(names.contains(&BUFFERS_TABLE_NAME));
         assert_eq!(
             schemas.len(),
-            5,
+            7,
             "update this test when adding new internal tables"
         );
         for schema in &schemas {
@@ -201,5 +226,46 @@ mod tests {
             .find(|c| c.name == "value")
             .expect("value column");
         assert!(!value.plaintext, "_lists.value must be encrypted");
+    }
+
+    #[test]
+    fn piece_coords_buffer_id_is_indexed_plaintext() {
+        let schema = piece_coords_schema();
+        let buffer_id = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "buffer_id")
+            .expect("_piecetext_pieces.buffer_id column");
+        assert!(matches!(buffer_id.column_type, ColumnType::Integer));
+        assert!(buffer_id.plaintext);
+        assert!(buffer_id.indexed);
+
+        let list_number = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "list_number")
+            .expect("_piecetext_pieces.list_number column");
+        assert!(list_number.indexed);
+    }
+
+    #[test]
+    fn buffers_owner_columns_are_indexed_plaintext() {
+        let schema = buffers_schema();
+        for name in ["owner_table", "owner_row_id", "owner_column"] {
+            let col = schema
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .expect("_piecetext_buffers owner column");
+            assert!(col.plaintext);
+            assert!(col.indexed);
+        }
+        let contents = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "contents")
+            .expect("_piecetext_buffers.contents column");
+        assert!(!contents.plaintext);
+        assert!(!contents.indexed);
     }
 }

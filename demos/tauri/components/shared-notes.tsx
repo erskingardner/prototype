@@ -2,7 +2,7 @@
 
 import { useRef, useEffect, useCallback, useState } from "react";
 import { useSpace, useSpaceDispatch } from "@/lib/store";
-import { listen } from "@tauri-apps/api/event";
+import { listenSafely } from "@/lib/tauri-events";
 import * as api from "@/lib/api";
 
 const DEBOUNCE_MS = 300;
@@ -36,6 +36,13 @@ interface RemoteCursor {
   sel_end: number;
   /** Timestamp of last update — used to fade stale cursors. */
   ts: number;
+}
+
+interface CursorPayload {
+  cursor: number;
+  sel_end: number;
+  user_name?: string;
+  channel_id?: number;
 }
 
 /** Shape of ephemeral events coming from the Tauri backend. */
@@ -88,11 +95,13 @@ function diffTexts(
 }
 
 export default function SharedNotes() {
-  const { notesText, user } = useSpace();
+  const { notesText, user, currentChannelId } = useSpace();
   const dispatch = useSpaceDispatch();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const mirrorRef = useRef<HTMLDivElement>(null);
+  const currentChannelIdRef = useRef<number | null>(currentChannelId);
+  currentChannelIdRef.current = currentChannelId;
 
   // Remote cursors keyed by uid.
   const [remoteCursors, setRemoteCursors] = useState<Map<number, RemoteCursor>>(new Map());
@@ -105,6 +114,12 @@ export default function SharedNotes() {
   const flushing = useRef(false);
   // Whether we have un-flushed local edits.
   const dirty = useRef(false);
+  // Channel whose visible text produced the pending local edit. This can differ
+  // from `currentChannelId` if the user switches channels before debounce fires.
+  const dirtyChannelIdRef = useRef<number | null>(null);
+  // A broadcast arrived while local edits prevented refreshing notes. Drain this
+  // once local edits are resolved so the UI doesn't stay on an old snapshot.
+  const missedNotesRefreshRef = useRef(false);
 
   const myUid = user?.user_id ?? -1;
 
@@ -121,6 +136,8 @@ export default function SharedNotes() {
   const sendCursor = useCallback((opts?: { force?: boolean }) => {
     const ta = textareaRef.current;
     if (!ta) return;
+    const channelId = currentChannelIdRef.current;
+    if (channelId === null) return;
     // Suppress while local edits haven't been flushed — otherwise the
     // remote cursor jumps to a position that doesn't yet exist there.
     if (!opts?.force && ta.value !== lastSyncedText.current) return;
@@ -131,15 +148,28 @@ export default function SharedNotes() {
       cursor: ta.selectionStart,
       sel_end: ta.selectionEnd,
       user_name: user?.user_name ?? "?",
+      channel_id: channelId,
     });
     api.sendEphemeral("cursor", payload).catch(() => {});
   }, [user?.user_name]);
+
+  const refreshActiveNotes = useCallback(async () => {
+    const activeChannelId = currentChannelIdRef.current;
+    if (activeChannelId === null) return;
+    const serverText = await api.getNotes(activeChannelId);
+    if (currentChannelIdRef.current !== activeChannelId) return;
+    console.debug("[notes] refreshed active notesText_len=%d", serverText.length);
+    dispatch({ type: "setNotesText", notesText: serverText });
+    missedNotesRefreshRef.current = false;
+  }, [dispatch]);
 
   // ── Flush: compute diff and send to backend ──────────────────────
 
   const flush = useCallback(async () => {
     const ta = textareaRef.current;
     if (!ta || flushing.current) return;
+    const channelIdAtFlush = dirtyChannelIdRef.current ?? currentChannelIdRef.current;
+    if (channelIdAtFlush === null) return;
 
     // Snapshot the textarea value at flush start. If the user keeps typing
     // during the awaits below, ta.value will diverge — we must NOT clear
@@ -150,39 +180,45 @@ export default function SharedNotes() {
     if (!diff) {
       console.debug("[notes] flush: no diff, skipping");
       dirty.current = false;
+      dirtyChannelIdRef.current = null;
+      if (missedNotesRefreshRef.current) {
+        try {
+          await refreshActiveNotes();
+        } catch (err) {
+          console.error("Notes refresh after no-op flush failed:", err);
+        }
+      }
       return;
     }
 
     console.debug("[notes] flush: diff", diff, "synced_len=", lastSyncedText.current.length, "local_len=", valueAtFlush.length);
     flushing.current = true;
     try {
-      if (diff.deleteCount > 0) {
-        console.debug("[notes] flush: notesDelete pos=", diff.pos, "count=", diff.deleteCount);
-        await api.notesDelete(diff.pos, diff.deleteCount);
-      }
-      if (diff.inserted.length > 0) {
-        console.debug("[notes] flush: notesInsert pos=", diff.pos, "text=", JSON.stringify(diff.inserted));
-        await api.notesInsert(diff.pos, diff.inserted);
-      }
+      console.debug("[notes] flush: notesApplyDiff channel=", channelIdAtFlush, "pos=", diff.pos, "deleteCount=", diff.deleteCount, "inserted=", JSON.stringify(diff.inserted));
+      await api.notesApplyDiff(channelIdAtFlush, diff.pos, diff.deleteCount, diff.inserted);
       // Re-fetch server state to reconcile (picks up our changes + any
       // concurrent remote edits merged by the server).
-      const serverText = await api.getNotes();
+      const serverText = await api.getNotes(channelIdAtFlush);
       console.debug("[notes] flush: reconciled, server_len=", serverText.length, "text=", JSON.stringify(serverText.slice(0, 80)));
-      lastSyncedText.current = serverText;
-      dispatch({ type: "setNotesText", notesText: serverText });
+      if (currentChannelIdRef.current === channelIdAtFlush) {
+        lastSyncedText.current = serverText;
+        dispatch({ type: "setNotesText", notesText: serverText });
 
-      // Send updated cursor position after reconciliation. Force past the
-      // throttle + suppression so the remote cursor immediately reflects
-      // post-flush state.
-      sendCursor({ force: true });
+        // Send updated cursor position after reconciliation. Force past the
+        // throttle + suppression so the remote cursor immediately reflects
+        // post-flush state.
+        sendCursor({ force: true });
+      }
     } catch (err) {
       console.error("Notes flush failed:", err);
       // Re-sync to recover from any inconsistency.
       try {
-        const serverText = await api.getNotes();
+        const serverText = await api.getNotes(channelIdAtFlush);
         console.debug("[notes] flush: error-recovery, server_len=", serverText.length);
-        lastSyncedText.current = serverText;
-        dispatch({ type: "setNotesText", notesText: serverText });
+        if (currentChannelIdRef.current === channelIdAtFlush) {
+          lastSyncedText.current = serverText;
+          dispatch({ type: "setNotesText", notesText: serverText });
+        }
       } catch {}
     } finally {
       flushing.current = false;
@@ -191,6 +227,9 @@ export default function SharedNotes() {
       // unflushed edits that must survive the upcoming store update.
       const stillDirty = ta.value !== valueAtFlush;
       dirty.current = stillDirty;
+      if (!stillDirty) {
+        dirtyChannelIdRef.current = null;
+      }
       if (stillDirty) {
         // Schedule another flush so the in-flight typing makes it to the server.
         if (debounceTimer.current) clearTimeout(debounceTimer.current);
@@ -199,12 +238,26 @@ export default function SharedNotes() {
           flush();
         }, DEBOUNCE_MS);
       }
+      if (!stillDirty && currentChannelIdRef.current !== channelIdAtFlush) {
+        try {
+          await refreshActiveNotes();
+        } catch {}
+      } else if (!stillDirty && missedNotesRefreshRef.current) {
+        try {
+          await refreshActiveNotes();
+        } catch (err) {
+          console.error("Notes refresh after skipped broadcast failed:", err);
+        }
+      }
     }
-  }, [dispatch, sendCursor]);
+  }, [refreshActiveNotes, sendCursor]);
 
   // ── Input handler: mark dirty, reset debounce ────────────────────
 
   const handleInput = useCallback(() => {
+    if (!dirty.current) {
+      dirtyChannelIdRef.current = currentChannelIdRef.current;
+    }
     dirty.current = true;
     console.debug("[notes] input: dirty, scheduling debounce", DEBOUNCE_MS, "ms");
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
@@ -218,6 +271,31 @@ export default function SharedNotes() {
     // sendCursor({ force: true }) updates remote clients with the correct
     // post-merge position.
   }, [flush]);
+
+  // If a user switches channels with an edit waiting on the debounce timer,
+  // flush the old channel promptly so the visible textarea can move on.
+  useEffect(() => {
+    const dirtyChannelId = dirtyChannelIdRef.current;
+    if (!dirty.current || dirtyChannelId === null || dirtyChannelId === currentChannelId) return;
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+    flush();
+  }, [currentChannelId, flush]);
+
+  // Catch updates that arrived before this component mounted or before the
+  // notes-specific listener below was registered.
+  useEffect(() => {
+    if (currentChannelId === null) return;
+    if (dirty.current || flushing.current) {
+      missedNotesRefreshRef.current = true;
+      return;
+    }
+    refreshActiveNotes().catch((err) => {
+      console.error("Initial notes refresh failed:", err);
+    });
+  }, [currentChannelId, refreshActiveNotes]);
 
   // ── On blur: flush immediately ───────────────────────────────────
 
@@ -244,6 +322,7 @@ export default function SharedNotes() {
     // If the user is actively typing (dirty local edits), don't clobber.
     // Our flush will reconcile.
     if (dirty.current || flushing.current) {
+      missedNotesRefreshRef.current = true;
       console.debug("[notes] store update: SKIPPED (dirty=%s flushing=%s) notesText_len=%d", dirty.current, flushing.current, notesText.length);
       return;
     }
@@ -257,6 +336,9 @@ export default function SharedNotes() {
         ta.value.length, lastSyncedText.current.length, notesText.length);
       // Make sure we eventually flush them.
       dirty.current = true;
+      if (dirtyChannelIdRef.current === null) {
+        dirtyChannelIdRef.current = currentChannelIdRef.current;
+      }
       if (!debounceTimer.current && !flushing.current) {
         debounceTimer.current = setTimeout(() => {
           debounceTimer.current = null;
@@ -274,13 +356,17 @@ export default function SharedNotes() {
 
     lastSyncedText.current = notesText;
     if (document.activeElement === ta) {
-      const cursor = ta.selectionStart;
-      const prevLen = ta.value.length;
+      const selectionStart = ta.selectionStart;
+      const selectionEnd = ta.selectionEnd;
       ta.value = notesText;
-      const delta = notesText.length - prevLen;
-      const newCursor = Math.max(0, Math.min(cursor + delta, notesText.length));
-      ta.selectionStart = newCursor;
-      ta.selectionEnd = newCursor;
+      const newSelectionStart = diff
+        ? adjustCursor(selectionStart, diff.pos, diff.deleteCount, diff.inserted.length)
+        : selectionStart;
+      const newSelectionEnd = diff
+        ? adjustCursor(selectionEnd, diff.pos, diff.deleteCount, diff.inserted.length)
+        : selectionEnd;
+      ta.selectionStart = Math.max(0, Math.min(newSelectionStart, notesText.length));
+      ta.selectionEnd = Math.max(0, Math.min(newSelectionEnd, notesText.length));
     } else {
       ta.value = notesText;
     }
@@ -301,15 +387,45 @@ export default function SharedNotes() {
     }
   }, [notesText]);
 
+  // ── Refresh notes on broadcasts, unless local edits are pending ─────
+
+  useEffect(() => {
+    if (currentChannelId === null) return;
+
+    return listenSafely("space-updated", async () => {
+      const channelId = currentChannelIdRef.current;
+      if (channelId === null) return;
+      if (dirty.current || flushing.current) {
+        missedNotesRefreshRef.current = true;
+        console.debug(
+          "[notes] space-updated: SKIPPED refresh (dirty=%s flushing=%s)",
+          dirty.current,
+          flushing.current
+        );
+        return;
+      }
+      try {
+        await refreshActiveNotes();
+      } catch (err) {
+        console.error("Notes refresh failed:", err);
+      }
+    });
+  }, [currentChannelId, refreshActiveNotes]);
+
   // ── Listen for remote cursor events ──────────────────────────────
 
   useEffect(() => {
-    const unlisten = listen<EphemeralEnvelope>("ephemeral:cursor", (event) => {
+    setRemoteCursors(new Map());
+  }, [currentChannelId]);
+
+  useEffect(() => {
+    const cleanup = listenSafely<EphemeralEnvelope>("ephemeral:cursor", (event) => {
       const env = event.payload;
       if (env.uid === myUid) return; // Ignore own cursor echoed back
       try {
         const decoded = new TextDecoder().decode(new Uint8Array(env.payload));
-        const data = JSON.parse(decoded) as { cursor: number; sel_end: number; user_name?: string };
+        const data = JSON.parse(decoded) as CursorPayload;
+        if (data.channel_id !== currentChannelIdRef.current) return;
         setRemoteCursors((prev) => {
           const next = new Map(prev);
           next.set(env.uid, {
@@ -344,7 +460,7 @@ export default function SharedNotes() {
     }, 5000);
 
     return () => {
-      unlisten.then((fn) => fn());
+      cleanup();
       clearInterval(expiry);
     };
   }, [myUid]);
@@ -352,9 +468,15 @@ export default function SharedNotes() {
   // Clean up timer on unmount.
   useEffect(() => {
     return () => {
-      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      if (debounceTimer.current) {
+        clearTimeout(debounceTimer.current);
+        debounceTimer.current = null;
+      }
+      if (dirty.current && !flushing.current) {
+        void flush();
+      }
     };
-  }, []);
+  }, [flush]);
 
   // ── Compute pixel position for a character offset ────────────────
 

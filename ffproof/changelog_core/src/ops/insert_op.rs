@@ -2,15 +2,17 @@ use super::{
     column_name_set, evaluate_acl, extract_acl_columns_from_entry, make_index_put, next_id_after,
     next_id_put, parse_column_entries, read_acl_rule, read_auto_increment, read_next_id,
     read_schema_columns, read_schema_indexes, read_schema_list_columns,
-    require_all_acl_columns_present, validate_max_entries, validate_not_internal_table,
-    validate_same_table_row, validate_sorted_entries, validate_user_access, verify_column_absent,
-    AclCheck, OpContext, OpReader, OpVerifier, OpVerifyResult, ParsedColumnEntry,
+    read_schema_piece_text_columns, require_all_acl_columns_present, validate_max_entries,
+    validate_not_internal_table, validate_same_table_row, validate_sorted_entries,
+    validate_user_access, verify_column_absent, AclCheck, OpContext, OpReader, OpVerifier,
+    OpVerifyResult, ParsedColumnEntry,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, ReadOp, TraceStep};
 use encrypted_spaces_storage_encoding::keys::{
     column_key, encode_list_parent, list_head_key, list_parent_key, list_tail_key,
-    schema_next_list_number_key,
+    piece_coords_head_key, piece_coords_next_list_number_key, piece_coords_parent_key,
+    piece_coords_tail_key, schema_next_list_number_key,
 };
 use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
 use encrypted_spaces_storage_encoding::{classify_insert_id, InsertId};
@@ -256,6 +258,131 @@ impl OpVerifier for InsertOp {
             }
         }
 
+        // Allocate list_numbers for PieceText columns. The List and PieceText
+        // namespaces are independent (separate counter, separate `_piecetext_pieces`
+        // head/tail/parent keys). The placeholder `0` Put for each PieceText
+        // column was already emitted in the column loop above; here it is
+        // overwritten in the same batch with the allocated list_number once the
+        // schema-key reads needed for allocation have run. Doing these reads
+        // after the index pass keeps fixtures for tables without PieceText
+        // columns undisturbed: they only gain a single trailing read.
+        let piece_text_cols = read_schema_piece_text_columns(table, reader, ctx)?;
+        if let Some(column) = list_cols.intersection(&piece_text_cols).next() {
+            return Err(ChangelogError::Generic(format!(
+                "insert: column '{column}' is declared as both List and PieceText"
+            )));
+        }
+        if !piece_text_cols.is_empty() {
+            // PieceText columns carry the placeholder value 0, like List columns.
+            let zero_stored =
+                value_to_bytes(&serde_json::json!(0)).expect("serializing 0 cannot fail");
+            for parsed in &parsed_entries {
+                let col_name = parsed.column.as_ref();
+                if piece_text_cols.contains(col_name) && parsed.kv.value != zero_stored {
+                    return Err(ChangelogError::Generic(format!(
+                        "insert: PieceText column '{col_name}' \
+                         must carry placeholder value 0"
+                    )));
+                }
+            }
+
+            // Read the per-namespace PieceText list_number counter.
+            let piece_text_number_base = {
+                let key = piece_coords_next_list_number_key();
+                let read = reader.read(ReadOp::Key(key))?;
+                match read.results.first() {
+                    Some((_, bytes)) => {
+                        if bytes.len() != 8 {
+                            return Err(ChangelogError::Generic(format!(
+                                "insert: piece_coords_next_list_number_key \
+                                 has invalid length {}",
+                                bytes.len()
+                            )));
+                        }
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(bytes);
+                        i64::from_be_bytes(buf)
+                    }
+                    None => 1i64,
+                }
+            };
+
+            // Allocate `list_number`s in alphabetical column order (the order
+            // `read_schema_piece_text_columns` returns), overwriting each
+            // PieceText column's placeholder Put with the allocated value.
+            let mut allocated_piece_texts: Vec<(String, i64)> = Vec::new();
+            for col_name in &piece_text_cols {
+                let list_number = piece_text_number_base
+                    .checked_add(allocated_piece_texts.len() as i64)
+                    .ok_or_else(|| {
+                        ChangelogError::Generic(format!(
+                            "insert: piece_text list_number overflow \
+                             at base={piece_text_number_base}+offset={}",
+                            allocated_piece_texts.len()
+                        ))
+                    })?;
+                let col_key = parsed_entries
+                    .iter()
+                    .zip(column_keys.iter())
+                    .find_map(|(parsed, key)| {
+                        if parsed.column.as_ref() == col_name {
+                            Some(key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        ChangelogError::Generic(format!(
+                            "insert: PieceText column '{col_name}' \
+                             missing from inserted columns"
+                        ))
+                    })?;
+                let stored_bytes =
+                    value_to_bytes(&serde_json::json!(list_number)).map_err(|e| {
+                        ChangelogError::Generic(format!(
+                            "insert: failed to serialize \
+                             piece_text list_number {list_number}: {e}"
+                        ))
+                    })?;
+                batch_ops.push(BatchOp::Put {
+                    key: col_key,
+                    value: stored_bytes,
+                });
+                allocated_piece_texts.push((col_name.clone(), list_number));
+            }
+
+            // Bump the PieceText list_number counter.
+            let num_piece_texts = allocated_piece_texts.len() as i64;
+            let new_counter = piece_text_number_base
+                .checked_add(num_piece_texts)
+                .ok_or_else(|| {
+                    ChangelogError::Generic(format!(
+                        "insert: piece_text list_number counter overflow \
+                         at base={piece_text_number_base}+{num_piece_texts}"
+                    ))
+                })?;
+            batch_ops.push(BatchOp::Put {
+                key: piece_coords_next_list_number_key(),
+                value: new_counter.to_be_bytes().to_vec(),
+            });
+
+            // Initialize `_piecetext_pieces` head/tail/parent for each new buffer.
+            for (col_name, ln) in &allocated_piece_texts {
+                batch_ops.push(BatchOp::Put {
+                    key: piece_coords_head_key(*ln),
+                    value: 0i64.to_be_bytes().to_vec(),
+                });
+                batch_ops.push(BatchOp::Put {
+                    key: piece_coords_tail_key(*ln),
+                    value: 0i64.to_be_bytes().to_vec(),
+                });
+                batch_ops.push(BatchOp::Put {
+                    key: piece_coords_parent_key(*ln),
+                    value: encode_list_parent(table, row_id, col_name),
+                });
+            }
+        }
+
         Ok(OpVerifyResult {
             write_steps: vec![TraceStep::Write(batch_ops)],
         })
@@ -330,7 +457,19 @@ mod tests {
         schema_indexes_key as make_schema_indexes_key,
         schema_list_columns_key as make_schema_list_columns_key,
         schema_next_id_key as make_schema_next_id_key,
+        schema_piece_text_columns_key as make_schema_pt_columns_key,
     };
+
+    /// Proven-read for `schema_piece_text_columns_key(table)` resolving to
+    /// "no PieceText columns" (absent key). Appended to the read sequence of
+    /// every insert that runs to completion, since the verifier always reads
+    /// the PieceText column set after the index pass.
+    fn pt_columns_absent_read(table: &str) -> ProvenRead {
+        ProvenRead {
+            op: ReadOp::Key(make_schema_pt_columns_key(table)),
+            results: vec![],
+        }
+    }
 
     /// Proven-read for `schema_id_mode_key(table)` resolving to AutoIncrement.
     fn id_mode_auto_read(table: &str) -> ProvenRead {
@@ -437,6 +576,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key(table)),
                 results: vec![],
             },
+            pt_columns_absent_read(table),
         ]
     }
 
@@ -487,6 +627,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         assert!(
@@ -576,6 +717,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         assert!(
@@ -758,6 +900,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![(make_schema_indexes_key("t"), b"age".to_vec())],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         let result =
@@ -958,6 +1101,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("posts")),
                 results: vec![],
             },
+            pt_columns_absent_read("posts"),
         ];
         let ctx = super::OpContext {
             current_change_id: 0,
@@ -1036,6 +1180,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("posts")),
                 results: vec![],
             },
+            pt_columns_absent_read("posts"),
         ];
         let ctx = super::OpContext {
             current_change_id: 0,
@@ -1199,6 +1344,7 @@ mod tests {
                 op: ReadOp::Key(rep_key),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         let result =
@@ -1408,6 +1554,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         let result =
@@ -1572,6 +1719,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         let result =
@@ -1854,6 +2002,7 @@ mod tests {
                 op: ReadOp::Key(make_schema_indexes_key("t")),
                 results: vec![],
             },
+            pt_columns_absent_read("t"),
         ];
         let mut reader = VerifierReader::new(&reads);
         let result =
@@ -1977,6 +2126,307 @@ mod tests {
         let msg = format!("{}", err.unwrap_err());
         assert!(
             msg.contains("id_mode") && msg.contains("missing"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // ─── PieceText column allocation tests ─────────────────────────────────
+
+    #[test]
+    fn test_insert_op_rejects_list_piece_text_column_overlap() {
+        let entry_body = column_key_placeholder("docs", "body");
+        let zero_stored = stored_i64(0);
+        let entry = make_entry_with_columns(1, std::slice::from_ref(&entry_body), &[zero_stored]);
+        let sk = user_status_key(1);
+        let reads = vec![
+            id_mode_auto_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_next_id_key("docs")),
+                results: vec![(make_schema_next_id_key("docs"), 5i64.to_be_bytes().to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_key("docs")),
+                results: vec![(make_schema_key("docs"), b"body".to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_list_columns_key("docs")),
+                results: vec![(
+                    make_schema_list_columns_key("docs"),
+                    list_columns_value(&["body"]),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_next_list_number_key()),
+                results: vec![],
+            },
+            no_acl_rule_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_indexes_key("docs")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_pt_columns_key("docs")),
+                results: vec![(
+                    make_schema_pt_columns_key("docs"),
+                    list_columns_value(&["body"]),
+                )],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both List and PieceText"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Insert a row with one PieceText column. The placeholder 0 is accepted,
+    /// a list_number is allocated from the (missing) PieceText counter, the
+    /// parent cell is overwritten with the allocated list_number, and the
+    /// `_piecetext_pieces` head/tail/parent keys are initialized. The PieceText
+    /// namespace is independent of the List namespace.
+    #[test]
+    fn test_insert_op_piece_text_column_allocates_from_missing_counter() {
+        use encrypted_spaces_storage_encoding::keys::{
+            piece_coords_head_key as make_pc_head_key,
+            piece_coords_next_list_number_key as make_pc_next_list_number_key,
+            piece_coords_parent_key as make_pc_parent_key,
+            piece_coords_tail_key as make_pc_tail_key,
+        };
+
+        let entry_body = column_key_placeholder("docs", "body");
+        let entry_title = column_key_placeholder("docs", "title");
+        let proof_body = column_key("docs", 5, "body");
+        let proof_title = column_key("docs", 5, "title");
+
+        let zero_stored = stored_i64(0);
+        let title_value = stored_str("hello");
+
+        let entries = vec![
+            KvData {
+                key: entry_body,
+                value: zero_stored.clone(),
+            },
+            KvData {
+                key: entry_title,
+                value: title_value.clone(),
+            },
+        ];
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid: 1,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::Insert,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+        let sk = user_status_key(1);
+        let reads = vec![
+            id_mode_auto_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_next_id_key("docs")),
+                results: vec![(make_schema_next_id_key("docs"), 5i64.to_be_bytes().to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_key("docs")),
+                results: vec![(make_schema_key("docs"), b"body\0title".to_vec())],
+            },
+            // No List columns.
+            ProvenRead {
+                op: ReadOp::Key(make_schema_list_columns_key("docs")),
+                results: vec![],
+            },
+            no_acl_rule_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_indexes_key("docs")),
+                results: vec![],
+            },
+            // "body" is a PieceText column.
+            ProvenRead {
+                op: ReadOp::Key(make_schema_pt_columns_key("docs")),
+                results: vec![(
+                    make_schema_pt_columns_key("docs"),
+                    list_columns_value(&["body"]),
+                )],
+            },
+            // piece_coords_next_list_number_key: missing → starts at 1.
+            ProvenRead {
+                op: ReadOp::Key(make_pc_next_list_number_key()),
+                results: vec![],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default())
+                .unwrap();
+
+        match &result.write_steps[0] {
+            TraceStep::Write(ops) => {
+                // Expected ops:
+                // 0: Put body column placeholder 0 (column loop)
+                // 1: Put title column (normal)
+                // 2: row-id counter bump (schema_next_id_key → 6)
+                // 3: Put body column OVERWRITE with list_number=1
+                // 4: piece_coords counter bump (→ 2)
+                // 5: piece_coords_head_key(1) = 0
+                // 6: piece_coords_tail_key(1) = 0
+                // 7: piece_coords_parent_key(1) = encode_list_parent("docs", 5, "body")
+                assert_eq!(ops.len(), 8, "ops: {ops:?}");
+
+                // Placeholder Put for the PieceText cell.
+                match &ops[0] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &proof_body);
+                        assert_eq!(value, &zero_stored);
+                    }
+                    other => panic!("Expected placeholder Put for body, got: {other:?}"),
+                }
+                // Normal column.
+                match &ops[1] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &proof_title);
+                        assert_eq!(value, &title_value);
+                    }
+                    other => panic!("Expected Put for title, got: {other:?}"),
+                }
+                // Row-id counter bump.
+                match &ops[2] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &make_schema_next_id_key("docs"));
+                        assert_eq!(value, &6i64.to_be_bytes().to_vec());
+                    }
+                    other => panic!("Expected row counter Put, got: {other:?}"),
+                }
+                // Overwriting Put: PieceText cell now carries list_number=1.
+                let expected_pt_stored =
+                    encrypted_spaces_storage_encoding::stored_value::value_to_bytes(
+                        &serde_json::json!(1),
+                    )
+                    .unwrap();
+                match &ops[3] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &proof_body);
+                        assert_eq!(value, &expected_pt_stored);
+                    }
+                    other => panic!("Expected overwrite Put for body, got: {other:?}"),
+                }
+                // PieceText counter bump (1 + 1 = 2).
+                match &ops[4] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &make_pc_next_list_number_key());
+                        assert_eq!(value, &2i64.to_be_bytes().to_vec());
+                    }
+                    other => panic!("Expected piece_coords counter Put, got: {other:?}"),
+                }
+                // head/tail/parent for list_number=1.
+                match &ops[5] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &make_pc_head_key(1));
+                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
+                    }
+                    other => panic!("Expected piece_coords head Put, got: {other:?}"),
+                }
+                match &ops[6] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &make_pc_tail_key(1));
+                        assert_eq!(value, &0i64.to_be_bytes().to_vec());
+                    }
+                    other => panic!("Expected piece_coords tail Put, got: {other:?}"),
+                }
+                match &ops[7] {
+                    BatchOp::Put { key, value } => {
+                        assert_eq!(key, &make_pc_parent_key(1));
+                        assert_eq!(value, &make_encode_list_parent("docs", 5, "body"));
+                    }
+                    other => panic!("Expected piece_coords parent Put, got: {other:?}"),
+                }
+            }
+            other => panic!("Expected Write step, got: {other:?}"),
+        }
+    }
+
+    /// A non-zero placeholder for a PieceText column is rejected, mirroring
+    /// the List-column placeholder check.
+    #[test]
+    fn test_insert_op_rejects_nonzero_piece_text_column() {
+        let entry_body = column_key_placeholder("docs", "body");
+        let entry_title = column_key_placeholder("docs", "title");
+
+        let entries = vec![
+            KvData {
+                key: entry_body,
+                value: stored_i64(42),
+            },
+            KvData {
+                key: entry_title,
+                value: stored_str("hi"),
+            },
+        ];
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid: 1,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::Insert,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+        let sk = user_status_key(1);
+        let reads = vec![
+            id_mode_auto_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_next_id_key("docs")),
+                results: vec![(make_schema_next_id_key("docs"), 5i64.to_be_bytes().to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_key("docs")),
+                results: vec![(make_schema_key("docs"), b"body\0title".to_vec())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_list_columns_key("docs")),
+                results: vec![],
+            },
+            no_acl_rule_read("docs"),
+            ProvenRead {
+                op: ReadOp::Key(make_schema_indexes_key("docs")),
+                results: vec![],
+            },
+            ProvenRead {
+                op: ReadOp::Key(make_schema_pt_columns_key("docs")),
+                results: vec![(
+                    make_schema_pt_columns_key("docs"),
+                    list_columns_value(&["body"]),
+                )],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = InsertOp::extract_and_validate(&entry, &mut reader, &super::OpContext::default());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("PieceText column") && msg.contains("placeholder value 0"),
             "unexpected error: {msg}"
         );
     }

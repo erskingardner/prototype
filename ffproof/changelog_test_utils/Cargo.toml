@@ -11,6 +11,7 @@ encrypted-spaces-changelog-core = { workspace = true }
 encrypted-spaces-backend = { workspace = true }
 encrypted-spaces-backend-server = { workspace = true }
 encrypted-spaces-crypto = { workspace = true }
+encrypted-spaces-storage-encoding = { workspace = true }
 tokio = { workspace = true }
 merk = { workspace = true }
 postcard = { workspace = true }

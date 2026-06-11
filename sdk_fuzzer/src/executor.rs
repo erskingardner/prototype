@@ -1582,10 +1582,10 @@ async fn do_neg_duplicate_explicit_id(rng: &mut impl Rng, model: &mut ModelState
 /// uses for primitive ops; the action path differs only in routing and
 /// in carrying the action-marker kv in the signed entry.
 ///
-/// Skips tables with `FileRef` or `List` columns to keep the row-shape
-/// matching code simple — those types need dedicated upload / flavour
-/// handling that's already exercised by `do_insert` against the
-/// primitive insert verifier.
+/// Skips tables with special-cell columns to keep the row-shape matching
+/// code simple. `FileRef` and `List` need dedicated upload / flavour
+/// handling that's already exercised by `do_insert`; `PieceText` is not
+/// generated yet because the fuzzer lacks a PieceText operation model.
 async fn do_call_action(rng: &mut impl Rng, model: &mut ModelState) -> SdkResult<()> {
     use encrypted_spaces_acl_types::ActionLeg;
 
@@ -1625,7 +1625,7 @@ async fn do_call_insert_action(
 ) -> SdkResult<()> {
     let schema = model.tables[table_name].schema.clone();
     if !is_action_friendly(&schema) {
-        return Ok(()); // skip tables with FileRef/List columns for now
+        return Ok(()); // skip tables with special-cell columns for now
     }
 
     let row = gen::random_row_with_overrides_owned(rng, &schema, &gen::RowOverrides::new());
@@ -1696,7 +1696,10 @@ async fn do_call_update_action(
         .iter()
         .filter(|c| {
             c.name != "id"
-                && !matches!(c.column_type, ColumnType::List | ColumnType::FileRef)
+                && !matches!(
+                    c.column_type,
+                    ColumnType::List | ColumnType::PieceText | ColumnType::FileRef
+                )
                 && cols
                     .map(|allow| allow.iter().any(|n| n == &c.name))
                     .unwrap_or(true)
@@ -1713,7 +1716,7 @@ async fn do_call_update_action(
         ColumnType::String | ColumnType::Text => {
             QueryParam::Text(value.as_str().unwrap_or("").to_string())
         }
-        ColumnType::Blob | ColumnType::FileRef | ColumnType::List => {
+        ColumnType::Blob | ColumnType::FileRef | ColumnType::List | ColumnType::PieceText => {
             unreachable!()
         }
     };
@@ -1841,14 +1844,16 @@ async fn do_call_delete_action(
 }
 
 /// Whether a table can be safely targeted by the fuzzer's action calls.
-/// Skips schemas with `FileRef` or `List` columns; those need the
-/// existing `do_insert` machinery (pre-upload, flavour fixing) which
-/// the action path doesn't currently mirror.
+/// Skips schemas with special-cell columns; those need either the existing
+/// `do_insert` machinery (pre-upload, flavour fixing) or a future PieceText
+/// operation model which the action path doesn't currently mirror.
 fn is_action_friendly(schema: &Schema) -> bool {
-    schema
-        .columns
-        .iter()
-        .all(|c| !matches!(c.column_type, ColumnType::FileRef | ColumnType::List))
+    schema.columns.iter().all(|c| {
+        !matches!(
+            c.column_type,
+            ColumnType::FileRef | ColumnType::List | ColumnType::PieceText
+        )
+    })
 }
 
 /// Build the `Vec<(column, QueryParam)>` payload `call_insert_action`
@@ -1869,7 +1874,7 @@ fn row_to_query_params(schema: &Schema, row: &Value) -> Vec<(String, QueryParam)
             ColumnType::String | ColumnType::Text => {
                 QueryParam::Text(v.as_str().unwrap_or("").to_string())
             }
-            ColumnType::Blob | ColumnType::FileRef | ColumnType::List => {
+            ColumnType::Blob | ColumnType::FileRef | ColumnType::List | ColumnType::PieceText => {
                 continue;
             }
         };

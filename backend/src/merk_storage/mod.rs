@@ -150,6 +150,19 @@ impl MerkStorage {
         self.iter_prefix(prefix)
     }
 
+    /// True if any key starts with `prefix`. Stops at the first match instead of
+    /// materializing the whole range, so existence checks over a large prefix
+    /// (e.g. a still-referenced `buffer_id` index) are O(1) rather than O(refs).
+    pub fn prefix_has_any(&self, prefix: &[u8]) -> Result<bool> {
+        match self.merk.snapshot() {
+            Some(tree) => Ok(tree
+                .iter_from(prefix)
+                .next()
+                .is_some_and(|(key, _)| key.starts_with(prefix))),
+            None => Ok(false),
+        }
+    }
+
     pub fn apply_batch_ops(&self, ops: Vec<Operation>) -> Result<()> {
         self.apply_batch(ops)
     }
@@ -1085,6 +1098,25 @@ impl Storage for MerkStorage {
             let list_columns_key = keys::schema_list_columns_key(&schema.name);
             let list_columns_value = encode_column_names(&list_col_names);
             ops.push((list_columns_key, Op::Put(list_columns_value)));
+        }
+
+        // Store compact piece-text-column-names list (null-separated) so the
+        // shared verifier's `read_schema_piece_text_columns` can authenticate
+        // which columns are PieceText without re-parsing the JSON schema.
+        let piece_text_col_names: std::collections::BTreeSet<String> = schema
+            .columns
+            .iter()
+            .filter(|c| matches!(c.column_type, crate::schema::ColumnType::PieceText))
+            .map(|c| c.name.clone())
+            .collect();
+        if !piece_text_col_names.is_empty() {
+            let piece_text_columns_key =
+                encrypted_spaces_storage_encoding::keys::schema_piece_text_columns_key(
+                    &schema.name,
+                );
+            let piece_text_columns_value =
+                encrypted_spaces_storage_encoding::encode_column_names(&piece_text_col_names);
+            ops.push((piece_text_columns_key, Op::Put(piece_text_columns_value)));
         }
 
         self.apply_batch(ops)

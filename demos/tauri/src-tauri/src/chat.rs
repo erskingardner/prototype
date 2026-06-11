@@ -1,5 +1,5 @@
 use anyhow::Result;
-use encrypted_spaces_sdk::{File, List, Space, TextArea};
+use encrypted_spaces_sdk::{File, List, PieceCoordList, Space};
 use serde::{Deserialize, Serialize};
 
 pub use crate::sdk_codegen::Actions;
@@ -10,7 +10,7 @@ pub struct Channel {
     pub name: String,
     pub description: Option<String>,
     pub tasks: List<crate::tasks::Task>,
-    pub notes: TextArea,
+    pub notes: PieceCoordList,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,7 +79,7 @@ pub async fn get_or_create_channel(space: &Space, name: &str) -> Result<i64> {
             name: name.to_string(),
             description: None,
             tasks: List::empty(),
-            notes: TextArea::empty(),
+            notes: PieceCoordList::empty(),
         })
         .execute()
         .await?)
