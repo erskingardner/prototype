@@ -5,6 +5,20 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[features]
+# The tree-fs file browser needs MRT (its move op is merk `MovePrefix`,
+# unsupported on AVL), so the demo builds against MRT by default.
+default = ["mrt"]
+# Pass MRT/AVL storage selection through to the SDK so the demo (and its
+# self-consistency harness) can be built against the `trev/mrt` backend.
+mrt = ["encrypted-spaces-sdk/mrt", "encrypted-spaces-sdk-codegen/mrt"]
+# Exposes the `fs_test_model` module from the library so the sibling
+# `encrypted-spaces-demo-test-harness` crate can reuse the same self-consistent
+# checker its cold-read tests need. The crate's own `#[cfg(test)]` builds get
+# the module unconditionally, so production (Tauri) builds that enable neither
+# never compile it.
+test-support = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 encrypted-spaces-sdk-codegen = { workspace = true }

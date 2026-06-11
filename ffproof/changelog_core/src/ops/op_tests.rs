@@ -4,7 +4,7 @@
 //! These tests verify:
 //! - **Adaptive reads**: read → inspect result → issue a second read whose key
 //!   depends on the first result.
-//! - **Multiple writes**: a single op producing more than one `TraceStep::Write`.
+//! - **Multiple writes**: a single op producing more than one `WriteOp`.
 //! - **Verifier rejection of unknown users**: the verifier's `VerifierReader`
 //!   correctly surfaces an empty-results read as an error.
 //! - **assert_all_consumed**: leftover proven reads are caught as errors.
@@ -15,8 +15,7 @@ mod tests {
     use crate::ops::{
         OpContext, OpReader, OpVerifier, OpVerifyResult, ProverReader, VerifierReader,
     };
-    use crate::{users_row_key, BatchOp, ProvenRead, PrunedMerkleTree, ReadOp, TraceStep};
-    use encrypted_spaces_acl_types::AccessRule;
+    use crate::{users_row_key, ProvenRead, ReadOp, WriteOp};
     use encrypted_spaces_storage_encoding::keys::{
         acl_rule_key, column_key, column_key_placeholder, schema_columns_key, schema_id_mode_key,
         schema_indexes_key, schema_list_columns_key, schema_next_id_key,
@@ -108,10 +107,10 @@ mod tests {
             }
 
             Ok(OpVerifyResult {
-                write_steps: vec![TraceStep::Write(vec![BatchOp::Put {
+                write_steps: vec![WriteOp::Put {
                     key: target_key,
                     value: entry.message.entries[0].value.clone(),
-                }])],
+                }],
             })
         }
     }
@@ -267,7 +266,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // 2. Multiple writes: one op producing multiple TraceStep::Write entries
+    // 2. Multiple writes: one op producing multiple WriteOp entries
     // ═════════════════════════════════════════════════════════════════════════
 
     const MULTI_WRITE_KEYS: &[&[u8]] = &[b"key_a", b"key_b", b"key_c"];
@@ -290,11 +289,9 @@ mod tests {
 
             let write_steps = MULTI_WRITE_KEYS
                 .iter()
-                .map(|k| {
-                    TraceStep::Write(vec![BatchOp::Put {
-                        key: k.to_vec(),
-                        value: entry.message.entries[0].value.clone(),
-                    }])
+                .map(|k| WriteOp::Put {
+                    key: k.to_vec(),
+                    value: entry.message.entries[0].value.clone(),
                 })
                 .collect();
 
@@ -311,14 +308,8 @@ mod tests {
         let result = result.expect("multi-write should succeed");
         assert_eq!(result.write_steps.len(), 3);
 
-        for (i, step) in result.write_steps.iter().enumerate() {
-            match step {
-                TraceStep::Write(ops) => {
-                    assert_eq!(ops.len(), 1);
-                    assert_eq!(ops[0].key(), MULTI_WRITE_KEYS[i]);
-                }
-                other => panic!("Expected Write, got {other:?}"),
-            }
+        for (i, op) in result.write_steps.iter().enumerate() {
+            assert_eq!(crate::ops::write_op_key(op), MULTI_WRITE_KEYS[i]);
         }
     }
 
@@ -381,11 +372,9 @@ mod tests {
             let write_steps = members
                 .results
                 .iter()
-                .map(|(k, _v)| {
-                    TraceStep::Write(vec![BatchOp::Put {
-                        key: k.clone(),
-                        value: entry.message.entries[0].value.clone(),
-                    }])
+                .map(|(k, _v)| WriteOp::Put {
+                    key: k.clone(),
+                    value: entry.message.entries[0].value.clone(),
                 })
                 .collect();
 
@@ -426,10 +415,7 @@ mod tests {
         let write_keys: Vec<&[u8]> = result
             .write_steps
             .iter()
-            .map(|s| match s {
-                TraceStep::Write(ops) => ops[0].key(),
-                _ => panic!("expected Write"),
-            })
+            .map(crate::ops::write_op_key)
             .collect();
         assert_eq!(
             write_keys,
@@ -670,218 +656,5 @@ mod tests {
 
         let err = AdaptiveTestOp::extract_and_validate(&entry, &mut reader, &no_acl());
         assert!(err.is_err(), "wrong read order should be rejected");
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // 7. Integration: verify_op_sequence rejects empty pruned tree
-    // ═════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_verify_op_sequence_rejects_empty_pruned_tree() {
-        use crate::changelog::{verify_op_sequence, ChangelogEntry, FastForwardRange};
-        use crate::mmr_tree::MmrTree;
-
-        let uid = 42;
-
-        let entry = ChangelogEntry::new(
-            OpType::Insert,
-            uid,
-            b"/",
-            &[b"tbl" as &[u8]],
-            &[b"payload" as &[u8]],
-            0,
-            0,
-            [0u8; 32],
-        )
-        .expect("entry creation");
-
-        let mut tree = MmrTree::new();
-        tree.initialize(&[0u8; 32]);
-        let start_clc_state = tree.tree_head().unwrap();
-        let entry_bytes = postcard::to_allocvec(&entry).expect("serialize entry");
-        tree.append(&entry_bytes);
-        let end_clc_state = tree.tree_head().unwrap();
-        let entries: Vec<Vec<u8>> = vec![entry_bytes.clone()];
-
-        let pruned_tree_bytes =
-            postcard::to_allocvec(&PrunedMerkleTree::Empty).expect("serialize empty pruned tree");
-
-        let range = FastForwardRange {
-            start_clc_state,
-            end_clc_state,
-            start_dc: Default::default(),
-            end_dc: Default::default(),
-            end_change_id: 1,
-            sigref_map: Default::default(),
-            recent_roots: Default::default(),
-            timestamp_hwm: 0,
-        };
-
-        let mut sigref_map = std::collections::BTreeMap::new();
-        let mut recent_roots: Vec<(u32, [u8; 32])> = Vec::new();
-        let mut timestamp_hwm = 0;
-        assert!(
-            !verify_op_sequence(
-                &entries,
-                &range,
-                &pruned_tree_bytes,
-                0,
-                &mut sigref_map,
-                &mut recent_roots,
-                &mut timestamp_hwm,
-            ),
-            "empty pruned tree should be rejected"
-        );
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // 8. Integration: verify_op_sequence + ACL enforcement
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /// Helper: serialize a single ACL rule for storage at
-    /// `acl_rule_key(table, op)`.
-    fn make_acl_rule_blob(rule: &AccessRule) -> Vec<u8> {
-        postcard::to_allocvec(rule).expect("serialize ACL rule")
-    }
-
-    /// Helper: build an insert ChangelogEntry with per-column keys including author_id.
-    fn make_insert_entry_with_author(uid: u32, author_id: i64) -> ChangelogEntry {
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (
-                column_key_placeholder("products", "author_id"),
-                value_to_bytes(&serde_json::json!(author_id)).unwrap(),
-            ),
-            (
-                column_key_placeholder("products", "name"),
-                value_to_bytes(&serde_json::json!("TestItem")).unwrap(),
-            ),
-            (
-                column_key_placeholder("products", "price"),
-                value_to_bytes(&serde_json::json!(1.5)).unwrap(),
-            ),
-        ];
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let key_refs: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
-        let val_refs: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
-
-        ChangelogEntry::new(
-            OpType::Insert,
-            uid,
-            b"/",
-            &key_refs,
-            &val_refs,
-            0,
-            0,
-            [0u8; 32],
-        )
-        .expect("entry creation")
-    }
-
-    /// Build a PrunedMerkleTree containing the required keys for the test.
-    fn build_pruned_tree_for_acl_test(
-        uid: u32,
-        acl_rule_blob: &[u8],
-        schema_value: &[u8],
-    ) -> PrunedMerkleTree {
-        let acl_key = acl_rule_key("products", "write");
-        let user_key = users_row_key(uid);
-        let schema_key = schema_columns_key("products");
-
-        let mut nodes: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (acl_key, acl_rule_blob.to_vec()),
-            (user_key, b"exists".to_vec()),
-            (schema_key, schema_value.to_vec()),
-        ];
-        nodes.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let (mid_key, mid_val) = nodes.remove(1);
-        let (left_key, left_val) = nodes.remove(0);
-        let (right_key, right_val) = nodes.remove(0);
-
-        PrunedMerkleTree::Full {
-            key: mid_key,
-            value: mid_val,
-            left: Box::new(PrunedMerkleTree::Full {
-                key: left_key,
-                value: left_val,
-                left: Box::new(PrunedMerkleTree::Empty),
-                right: Box::new(PrunedMerkleTree::Empty),
-            }),
-            right: Box::new(PrunedMerkleTree::Full {
-                key: right_key,
-                value: right_val,
-                left: Box::new(PrunedMerkleTree::Empty),
-                right: Box::new(PrunedMerkleTree::Empty),
-            }),
-        }
-    }
-
-    /// Verify that verify_op_sequence REJECTS an insert when
-    /// ResourceColumn("author_id") != AuthUserId.
-    ///
-    /// This exercises the ACL denial path in the verifier (Stage 1).
-    /// The ACL-allowed path is tested by the integration test
-    /// `test_acl_insert_allowed` in ff_test which runs the full
-    /// prove-verify pipeline with a real merk tree.
-    #[test]
-    fn test_verify_op_sequence_acl_rejects_wrong_author() {
-        use crate::changelog::{verify_op_sequence, FastForwardRange};
-        use crate::mmr_tree::MmrTree;
-        use encrypted_spaces_acl_types::{ColumnNamespace, ComparisonOp, RuleValue};
-
-        let uid: u32 = 7;
-        let wrong_author_id: i64 = 99; // does NOT match uid
-
-        let rule = AccessRule::comparison(
-            RuleValue::column(ColumnNamespace::Resource, "author_id"),
-            ComparisonOp::Equal,
-            RuleValue::AuthUserId,
-        );
-        let acl_rule_blob = make_acl_rule_blob(&rule);
-        let schema_value = b"author_id\0name\0price".to_vec();
-
-        // Build entry with WRONG author_id
-        let entry = make_insert_entry_with_author(uid, wrong_author_id);
-        let entry_bytes = postcard::to_allocvec(&entry).expect("serialize entry");
-
-        let mut tree = MmrTree::new();
-        tree.initialize(&[0u8; 32]);
-        let start_clc_state = tree.tree_head().unwrap();
-        tree.append(&entry_bytes);
-        let end_clc_state = tree.tree_head().unwrap();
-        let entries_vec: Vec<Vec<u8>> = vec![entry_bytes.clone()];
-
-        let pruned_tree = build_pruned_tree_for_acl_test(uid, &acl_rule_blob, &schema_value);
-        let pruned_tree_bytes = postcard::to_allocvec(&pruned_tree).expect("serialize");
-
-        let range = FastForwardRange {
-            start_clc_state,
-            end_clc_state,
-            start_dc: Default::default(),
-            end_dc: Default::default(),
-            end_change_id: 1,
-            sigref_map: Default::default(),
-            recent_roots: Default::default(),
-            timestamp_hwm: 0,
-        };
-
-        // verify_op_sequence rejects the synthetic proof before it can
-        // exercise ACL denial because tracer verification fails.
-        let mut sigref_map = std::collections::BTreeMap::new();
-        let mut recent_roots: Vec<(u32, [u8; 32])> = Vec::new();
-        let mut timestamp_hwm = 0;
-        assert!(
-            !verify_op_sequence(
-                &entries_vec,
-                &range,
-                &pruned_tree_bytes,
-                0,
-                &mut sigref_map,
-                &mut recent_roots,
-                &mut timestamp_hwm,
-            ),
-            "synthetic proof with mismatched roots should be rejected"
-        );
     }
 }

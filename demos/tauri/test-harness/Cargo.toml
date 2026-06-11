@@ -6,6 +6,13 @@ authors.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# MRT by default, matching the demo (tree-fs moves need merk `MovePrefix`).
+default = ["mrt"]
+# Pass MRT/AVL storage selection through to the demo (and thus the SDK), so the
+# self-consistency harness can run against the `trev/mrt` backend.
+mrt = ["encrypted-spaces-demo/mrt"]
+
 [lib]
 name = "encrypted_spaces_demo_test_harness"
 path = "src/lib.rs"
@@ -16,7 +23,11 @@ path = "src/bin/harness.rs"
 
 [dependencies]
 encrypted-spaces-acl-types = { workspace = true }
-encrypted-spaces-demo = { path = "../src-tauri" }
+# `test-support` exposes the demo's `fs_test_model` (FsModel + the
+# assert_matches_model checker) so the harness cold-read tests can validate the
+# read surface against the same self-consistent checker the single-space tests
+# use.
+encrypted-spaces-demo = { path = "../src-tauri", features = ["test-support"] }
 # Use `local-transport` so the harness can spin up an in-process server.
 encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
 anyhow = { workspace = true }

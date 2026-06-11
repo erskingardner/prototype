@@ -36,12 +36,18 @@ use crate::cache::Cache;
 use crate::{state, AuthContext, Space, SpaceId, Transport, UserWithSecrets};
 use crate::{ApplicationSchema, DataCommitment, Schema};
 
-/// Hardcoded merk root of a freshly-initialised internal-schemas
-/// backend.  Guards against silent drift: changes to the internal
-/// schema bundle will fail `Space::new`'s sanity expectation and the
-/// dedicated test in `lib.rs`, prompting an intentional update.
+/// Hardcoded merk root of a freshly-initialised internal-schemas backend, one
+/// value per backend (AVL by default, MRT under `--features mrt`) since the two
+/// backends hash the same key/value set to different roots.  Guards against
+/// silent drift: a change to the internal schema bundle shifts this root and
+/// fails the dedicated test in `lib.rs`, which prints the new value to copy into
+/// the matching branch below.
+#[cfg(not(feature = "mrt"))]
 const INITIAL_INTERNAL_DATA_COMMITMENT_HEX: &str =
-    "ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103";
+    "7ac1d1e97fd6ae104739d533037e7c6bf7914f56cb0f1ee8e9f6e1e9d8ac0ec3";
+#[cfg(feature = "mrt")]
+const INITIAL_INTERNAL_DATA_COMMITMENT_HEX: &str =
+    "0fca009d67be408dce1619fa1b4849a12467fd66c2326b09110dc92521b0cb26";
 
 /// Decoded form of [`INITIAL_INTERNAL_DATA_COMMITMENT_HEX`], used as
 /// the starting commitment for in-tree tests and the `Space::new`

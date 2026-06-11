@@ -1,7 +1,7 @@
 [
   {
     "group": "core",
-    "packages": "-p encrypted-spaces-crypto -p encrypted-spaces-key-manager -p encrypted-spaces-retention -p encrypted-spaces-acl-types -p encrypted-spaces-storage-encoding -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-changelog-core -p encrypted-spaces-zkp -p encrypted-spaces-ffproof -p ffproof-tracer -p encrypted-spaces-ff-test",
+    "packages": "-p encrypted-spaces-crypto -p encrypted-spaces-key-manager -p encrypted-spaces-retention -p encrypted-spaces-acl-types -p encrypted-spaces-storage-encoding -p encrypted-spaces-changelog-test-utils -p encrypted-spaces-changelog-core -p encrypted-spaces-zkp -p encrypted-spaces-ffproof -p encrypted-spaces-ff-test",
     "filter": ""
   },
   {

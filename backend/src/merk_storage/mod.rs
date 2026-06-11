@@ -51,10 +51,15 @@ use {
         query::Predicate,
         storage::Storage,
     },
-    merk::{InMemoryMerk, Node},
+    ffproof_tracer_shared::backend,
     serde::Deserialize,
     std::sync::Arc,
 };
+
+#[cfg(feature = "merk")]
+pub use ffproof_tracer_shared::Checkpoint;
+#[cfg(feature = "merk")]
+use ffproof_tracer_shared::WriteOp;
 
 #[cfg(feature = "merk")]
 type Operation = (Vec<u8>, Op);
@@ -76,14 +81,14 @@ pub const ID_FIELD: &str = "id";
 #[cfg(feature = "merk")]
 pub struct MerkStorage {
     /// The Merk tree wrapped in Arc for shared ownership.
-    pub merk: Arc<InMemoryMerk>,
+    pub merk: Arc<backend::Tree>,
 }
 
 #[cfg(feature = "merk")]
 impl MerkStorage {
     /// Create a new in-memory MerkStorage.
     pub fn new() -> Self {
-        let merk = InMemoryMerk::new();
+        let merk = backend::Tree::new();
 
         Self {
             merk: Arc::new(merk),
@@ -101,9 +106,14 @@ impl MerkStorage {
         Ok(storage)
     }
 
-    /// Clone the current Merk root node. Returns `None` if the tree is empty.
-    pub fn snapshot(&self) -> Option<Node> {
-        self.merk.snapshot()
+    /// Checkpoint the current Merk tree. Returns `None` if the tree is empty.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        let checkpoint = self.merk.checkpoint();
+        if checkpoint.is_empty() {
+            None
+        } else {
+            Some(checkpoint)
+        }
     }
 
     /// Get the current root hash of the Merk tree.
@@ -118,30 +128,19 @@ impl MerkStorage {
 
     /// Iterate over a key range using the current in-memory tree.
     fn iter_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let Some(tree) = self.merk.snapshot() else {
+        let Some(tree) = self.checkpoint() else {
             return Ok(Vec::new());
         };
 
-        if let Some(end) = end {
-            if start >= end {
-                return Ok(Vec::new());
-            }
-
-            Ok(tree
-                .iter_from(start)
-                .take_while(|(key, _)| key.as_slice() < end)
-                .collect())
-        } else {
-            Ok(tree.iter_from(start).collect())
-        }
+        tree.collect_range(start, end)
+            .map_err(|e| SdkError::DatabaseError(format!("range read failed: {e:?}")))
     }
 
     fn iter_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        match self.merk.snapshot() {
-            Some(tree) => Ok(tree
-                .iter_from(prefix)
-                .take_while(|(key, _)| key.starts_with(prefix))
-                .collect()),
+        match self.checkpoint() {
+            Some(tree) => tree
+                .collect_prefix(prefix)
+                .map_err(|e| SdkError::DatabaseError(format!("prefix read failed: {e:?}"))),
             None => Ok(Vec::new()),
         }
     }
@@ -155,25 +154,22 @@ impl MerkStorage {
     }
 
     /// Execute a batch of operations against the in-memory tree.
-    fn apply_batch(&self, mut ops: Vec<Operation>) -> Result<()> {
+    fn apply_batch(&self, ops: Vec<Operation>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
 
-        ops.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Dedup: last-write-wins for duplicate keys
-        let mut seen = std::collections::HashSet::new();
-        let mut batch = Vec::new();
-        for op in ops.into_iter().rev() {
-            if seen.insert(op.0.clone()) {
-                batch.push(op);
-            }
-        }
-        batch.reverse();
+        let write_ops: Vec<WriteOp> = ops
+            .into_iter()
+            .map(|(key, op)| match op {
+                Op::Put(value) => WriteOp::Put { key, value },
+                Op::Delete => WriteOp::Delete { key },
+                Op::DeleteRange(end) => WriteOp::DeleteRange { start: key, end },
+            })
+            .collect();
 
         self.merk
-            .apply_batch(&batch)
+            .apply_write_ops(&write_ops)
             .map_err(|e| SdkError::DatabaseError(format!("Failed to apply batch: {e:?}")))?;
 
         Ok(())
@@ -1375,6 +1371,7 @@ pub fn reassemble_row(
     Ok(serde_json::Value::Object(obj))
 }
 
+#[cfg(feature = "merk")]
 fn reassemble_row_projecting_columns(
     row_id: i64,
     column_entries: &[(Vec<u8>, Vec<u8>)],
@@ -1447,6 +1444,7 @@ pub fn group_columns_into_rows(
     Ok(rows)
 }
 
+#[cfg(feature = "merk")]
 fn group_columns_into_rows_projecting_columns(
     column_entries: &[(Vec<u8>, Vec<u8>)],
     columns: &std::collections::BTreeSet<String>,

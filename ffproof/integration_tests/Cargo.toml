@@ -40,6 +40,15 @@ encrypted-spaces-ffproof-methods-bench = { path = "../methods_bench" }
 #   cargo bench -p encrypted-spaces-ff-test --features real-proofs,cuda
 real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
 cuda = ["encrypted-spaces-ffproof/cuda"]
+mrt = [
+    "encrypted-spaces-ffproof/mrt",
+    "encrypted-spaces-backend/mrt",
+    "encrypted-spaces-backend-server/mrt",
+    "encrypted-spaces-changelog-core/mrt",
+    "encrypted-spaces-changelog-test-utils/mrt",
+    "encrypted-spaces-ffproof-methods-bench/mrt",
+    "encrypted-spaces-sdk/mrt",
+]
 
 [[bench]]
 name = "ff_cycle_benchmarks"

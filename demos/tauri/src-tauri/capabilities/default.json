@@ -11,10 +11,14 @@
     "dialog:default",
     "dialog:allow-save",
     "dialog:allow-open",
+    "dialog:allow-confirm",
+    "dialog:allow-ask",
+    "dialog:allow-message",
     "fs:default",
     "fs:allow-app-write",
     "fs:allow-app-read",
     "fs:allow-write",
+    "fs:allow-write-file",
     "fs:allow-read",
     "fs:allow-stat"
   ]

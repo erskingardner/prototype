@@ -8,7 +8,7 @@ use encrypted_spaces_backend::merk_storage::{
 use encrypted_spaces_backend::query::{ComparisonOperator, Predicate, QueryParam};
 use encrypted_spaces_backend::schema::{ColumnType, Schema};
 use encrypted_spaces_changelog_core::changelog::Change;
-use encrypted_spaces_changelog_core::BatchOp;
+use encrypted_spaces_changelog_core::WriteOp;
 
 /// Extract cache-addressable predicates from an optional server-side predicate.
 ///
@@ -629,7 +629,7 @@ impl ColumnIndex {
 pub(crate) async fn update_cache_from_proven_writes(
     space: &crate::Space,
     change: &Change,
-    writes: &[BatchOp],
+    writes: &[WriteOp],
 ) {
     // 1. Resolve every write into a (column_key, value_bytes) pair the
     //    SELECT-side reassembler can consume. Deletes are tracked separately
@@ -639,14 +639,18 @@ pub(crate) async fn update_cache_from_proven_writes(
 
     for op in writes {
         match op {
-            BatchOp::Put { key, value } => {
+            WriteOp::Put { key, value } => {
                 column_entries.push((key.clone(), value.clone()));
             }
-            BatchOp::Delete { key } => {
+            WriteOp::Delete { key } => {
                 if let Ok(ParsedKey::Column { table, row_id, .. }) = parse_key(key) {
                     deletes.entry(table).or_default().insert(row_id);
                 }
             }
+            // p2 ops emit only point writes; range/prefix/move never reach the cache.
+            WriteOp::DeleteRange { .. }
+            | WriteOp::DeletePrefix { .. }
+            | WriteOp::MovePrefix { .. } => {}
         }
     }
 
@@ -672,7 +676,10 @@ pub(crate) async fn update_cache_from_proven_writes(
                 .iter()
                 .filter_map(|op| {
                     let key = match op {
-                        BatchOp::Put { key, .. } | BatchOp::Delete { key } => key,
+                        WriteOp::Put { key, .. } | WriteOp::Delete { key } => key,
+                        WriteOp::DeleteRange { start, .. } => start,
+                        WriteOp::DeletePrefix { prefix } => prefix,
+                        WriteOp::MovePrefix { from, .. } => from,
                     };
                     match parse_key(key) {
                         Ok(ParsedKey::Column { table, .. }) => Some(table),
@@ -781,7 +788,7 @@ pub(crate) async fn update_cache_from_proven_writes(
 /// whether to insert vs. patch.
 pub(crate) fn new_row_id_for_table(
     space: &crate::Space,
-    writes: &[BatchOp],
+    writes: &[WriteOp],
     table: &str,
 ) -> Option<i64> {
     let schema_non_id_cols: BTreeSet<String> = space.get_table_schema(table).map(|s| {
@@ -798,7 +805,7 @@ pub(crate) fn new_row_id_for_table(
     let mut per_row: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
     for op in writes {
         let key = match op {
-            BatchOp::Put { key, .. } => key,
+            WriteOp::Put { key, .. } => key,
             _ => continue,
         };
         if let Ok(ParsedKey::Column {

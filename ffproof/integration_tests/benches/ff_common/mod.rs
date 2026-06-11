@@ -37,9 +37,9 @@ use encrypted_spaces_changelog_core::changelog::{
     initial_clc_state, Change, ChangeLog, ChangeResponse, ChangelogEntry, ClcState, Digest,
     FastForwardData, FastForwardJournal, FastForwardRange,
 };
-use encrypted_spaces_changelog_core::{create_trace, encode_pruned_compact, PrunedMerkleTreeStats};
+use encrypted_spaces_changelog_core::WriteOp;
 use encrypted_spaces_ffproof::common::FFProof;
-use encrypted_spaces_ffproof::prover::{extract_input_steps, prove_ff_chunk};
+use encrypted_spaces_ffproof::prover::{extract_trace_bytes, prove_ff_chunk};
 use encrypted_spaces_ffproof_methods_bench::{EXTEND_FF_BENCH_ELF, EXTEND_FF_BENCH_ID};
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use encrypted_spaces_sdk::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
@@ -301,7 +301,6 @@ pub struct BenchProveResult {
 
 pub struct BenchWitnessStats {
     pub serialized_bytes: usize,
-    pub tree: PrunedMerkleTreeStats,
 }
 
 pub struct BenchProofChain {
@@ -372,16 +371,8 @@ pub async fn prove_pending_changes(state: &Arc<Mutex<SpaceState>>) -> ProveResul
         .as_ref()
         .expect("No tree snapshot — state should have one after init");
 
-    let steps = extract_input_steps(
-        &state.changelog,
-        &state.change_responses,
-        start_idx,
-        tree_snapshot,
-    )
-    .expect("extract_input_steps failed");
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let tracer_proof_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+    let tracer_proof_bytes = extract_trace_bytes(&state.changelog, start_idx, tree_snapshot)
+        .expect("extract_trace_bytes failed");
     let _quiet = std::env::var_os("FF_BENCH_SHOW_STDERR")
         .is_none()
         .then(SuppressStderr::new);
@@ -438,23 +429,13 @@ pub async fn prove_pending_changes_bench(
         .as_ref()
         .expect("No tree snapshot — state should have one after init");
 
-    let steps = extract_input_steps(
-        &state.changelog,
-        &state.change_responses,
-        start_idx,
-        tree_snapshot,
-    )
-    .expect("extract_input_steps failed");
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let witness = BenchWitnessStats {
-        serialized_bytes: 0,
-        tree: tracer_proof.pruned_tree.stats(),
-    };
-    let tracer_proof_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+    let tracer_proof_bytes = extract_trace_bytes(&state.changelog, start_idx, tree_snapshot)
+        .expect("extract_trace_bytes failed");
+    // The witness is now merk's opaque `finalize_trace` output rather than a
+    // `PrunedMerkleTree`, so per-node tree stats no longer apply; only the
+    // serialized byte length stays meaningful for bench reporting.
     let witness = BenchWitnessStats {
         serialized_bytes: tracer_proof_bytes.len(),
-        ..witness
     };
     let is_first = bench_chain.proof.is_none();
 
@@ -602,13 +583,6 @@ pub fn print_bench_timing(label: &str, result: &BenchProveResult) {
     if let Some(witness) = result.witness.as_ref() {
         eprintln!("    witness:");
         line!(6, "serialized_bytes", witness.serialized_bytes);
-        line!(6, "full_nodes", witness.tree.full_nodes);
-        line!(6, "pruned_nodes", witness.tree.pruned_nodes);
-        line!(6, "empty_slots", witness.tree.empty_slots);
-        line!(6, "full_key_bytes", witness.tree.full_key_bytes);
-        line!(6, "full_value_bytes", witness.tree.full_value_bytes);
-        line!(6, "pruned_key_bytes", witness.tree.pruned_key_bytes);
-        line!(6, "max_depth", witness.tree.max_depth);
     }
     eprintln!("    guest_cycles:");
     line!(6, "user_total", result.cycles);
@@ -995,17 +969,29 @@ pub struct Workload {
 async fn fast_apply_and_rebase(
     state: &Arc<Mutex<SpaceState>>,
     space: Space,
-    mut batch: Vec<(Vec<u8>, merk::Op)>,
+    batch: Vec<(Vec<u8>, merk::Op)>,
 ) -> Space {
     let new_root = {
         let mut s = state.lock().await;
-        batch.sort_by(|a, b| a.0.cmp(&b.0));
-        s.db.merk.apply_batch(&batch).expect("merk apply_batch");
+        // `apply_write_ops` applies in issue order (no sort — AVL is
+        // write-order sensitive); the rebased genesis captures whatever root
+        // results.
+        let write_ops: Vec<WriteOp> = batch
+            .into_iter()
+            .map(|(key, op)| match op {
+                merk::Op::Put(value) => WriteOp::Put { key, value },
+                merk::Op::Delete => WriteOp::Delete { key },
+                merk::Op::DeleteRange(end) => WriteOp::DeleteRange { start: key, end },
+            })
+            .collect();
+        s.db.merk
+            .apply_write_ops(&write_ops)
+            .expect("merk apply_write_ops");
         let current_root = s.get_root_hash().await;
         s.changelog = ChangeLog::new(&current_root);
         s.change_responses.clear();
         s.ff_proof = None;
-        s.tree_snapshot = s.db.snapshot();
+        s.tree_snapshot = s.db.checkpoint();
         // Mirror `reinitialize_changelog`: clear the per-user sigref view
         // alongside the changelog reset so the next SDK change (sig_ref=0)
         // is accepted against a fresh genesis chain.

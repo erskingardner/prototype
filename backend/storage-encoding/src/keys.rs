@@ -23,6 +23,26 @@ use crate::tuple::{decode_tuple, encode_tuple, DecodeError, TupleElement};
 use std::borrow::Cow;
 use std::fmt;
 
+/// Reserved sub-element under `[S, table]` that holds the table's own schema
+/// blob.
+///
+/// The bare `[S, table]` tuple is an ancestor of every other per-table schema
+/// key (`columns`, `next_id`, `id_mode`, `acl`, `action`, …), so storing a value
+/// directly at `[S, table]` would make it a byte-prefix of those keys — which the
+/// radix/MRT backend rejects (no stored key may be a prefix of another). Holding
+/// the schema blob under this reserved child slot keeps every stored key a
+/// non-nesting leaf, so the whole stored-key set is prefix-free with **no key
+/// marker** and AVL/MRT use identical keys.
+///
+/// `"schema"` is a **reserved** sub-tag, distinct from every other per-table
+/// sub-key (`columns`, `indexes`, `next_id`, `id_mode`, `acl`, `only_via_actions`,
+/// `action`, …). FoundationDB string encoding is null-terminated, so distinct
+/// sub-tags can never be byte-prefixes of one another — keeping the stored-key
+/// set prefix-free. `parse_schema_elements` maps `[S, table, "schema"]` back to
+/// `ParsedKey::Schema` through its unknown-sub-tag fall-through. Do not reuse
+/// `"schema"` as a sub-key for any other purpose.
+const SCHEMA_SELF: &str = "schema";
+
 /// Error type for converting values to `TupleElement`.
 ///
 /// Returned when a value (e.g. a JSON array or object) cannot be represented
@@ -168,9 +188,12 @@ pub fn schema_prefix() -> Vec<u8> {
 
 /// Build a key for storing table schema.
 ///
-/// Format: `tuple("S", table)`
+/// Format: `tuple("S", table, "schema")` — the schema blob lives in the reserved
+/// [`SCHEMA_SELF`] child slot, not at the bare `[S, table]` prefix, so it never
+/// becomes a prefix of the other per-table schema keys (keeps the stored-key set
+/// prefix-free for the radix/MRT backend; see [`SCHEMA_SELF`]).
 pub fn schema_key(table: &str) -> Vec<u8> {
-    encode_tuple(&[TAG_SCHEMA.into(), table.into()])
+    encode_tuple(&[TAG_SCHEMA.into(), table.into(), SCHEMA_SELF.into()])
 }
 
 /// Build a key for storing the compact column-names list for a table.
@@ -516,6 +539,26 @@ pub fn action_marker_key(primary_table: &str) -> Vec<u8> {
         "action_marker".into(),
         primary_table.into(),
     ])
+}
+
+/// The key the SDK prepends to a `OpType::Native` signed entry as the
+/// native-op header.  The associated value is a fixed 4-byte raw layout
+/// `[kind: u16_be][version: u16_be]` that selects the hardcoded handler.
+/// Like `action_marker_key`, this is a routing marker and is never written
+/// to the tree.
+///
+/// Format: `tuple("M", "native_op")`
+pub fn native_marker_key() -> Vec<u8> {
+    encode_tuple(&[TAG_MARKER.into(), "native_op".into()])
+}
+
+/// The key the SDK uses to carry a `OpType::Native` signed entry's raw
+/// payload bytes.  Like `native_marker_key`, this is a routing marker and
+/// is never written to the tree.
+///
+/// Format: `tuple("M", "native_payload")`
+pub fn native_payload_key() -> Vec<u8> {
+    encode_tuple(&[TAG_MARKER.into(), "native_payload".into()])
 }
 
 /// Prepend [`ACTION_STORAGE_VERSION`] to a serialized action body.

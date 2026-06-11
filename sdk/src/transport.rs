@@ -6,6 +6,7 @@ use encrypted_spaces_backend::{
     schema::Schema,
 };
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use std::any::Any;
 use std::collections::HashMap;
@@ -74,6 +75,22 @@ pub trait Transport: Send + Sync + 'static {
         commitment: &[u8; 32],
         schemas: &HashMap<String, Schema>,
     ) -> Result<VerifiedRows>;
+
+    /// Execute a raw changelog read against the current data commitment.
+    ///
+    /// The tree filesystem (Phase B) stores its records under raw `b"/_fs"`
+    /// keys rather than table-column keys, so it reads through this op instead
+    /// of `select`. Transports that do not override it return an explicit
+    /// unsupported error.
+    async fn raw_read(
+        &self,
+        _op: ReadOp,
+        _commitment: &[u8; 32],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Err(SdkError::ValidationError(
+            "raw changelog reads are not supported by this transport".into(),
+        ))
+    }
 
     /// Upcast to `&dyn Any` for runtime downcasts to concrete transport types.
     fn as_any(&self) -> &dyn Any;

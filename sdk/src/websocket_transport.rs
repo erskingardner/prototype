@@ -3,11 +3,13 @@ use base64::Engine;
 use encrypted_spaces_backend::{
     access_control::AuthContext,
     error::{Result, SdkError},
-    merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
+    merk_storage::proofs::{
+        verify_prefix, verify_proof, verify_query_proof_with_hashed_values, VerifiedRows,
+    },
     proto::{
         db_request, db_response, values_sidecar_from_proto, values_sidecar_to_proto, ws_frame,
         AddMemberRequest, ChangeRequest, DbRequest, DbResponse, Ephemeral, FastForwardRequest,
-        RemoveMemberRequest, SelectRequest, WsFrame,
+        RawReadRequest, RemoveMemberRequest, SelectRequest, WsFrame,
     },
     query::Query,
     schema::Schema,
@@ -15,6 +17,7 @@ use encrypted_spaces_backend::{
 use encrypted_spaces_changelog_core::changelog::{
     Change, ChangeResponse, ChangelogEntry, FastForwardData,
 };
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use prost::Message;
 pub(crate) const DEBUG: bool = true;
@@ -722,6 +725,47 @@ impl Transport for WebSocketTransport {
             )
         } else {
             Err(SdkError::DatabaseError("unexpected response type".into()))
+        }
+    }
+
+    async fn raw_read(&self, op: ReadOp, commitment: &[u8; 32]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use encrypted_spaces_backend::proto::raw_read_request::Target;
+
+        let target = match &op {
+            ReadOp::Key(key) => Target::Key(key.clone()),
+            ReadOp::Prefix(prefix) => Target::Prefix(prefix.clone()),
+            ReadOp::Range { .. } => {
+                return Err(SdkError::ValidationError(
+                    "WebSocketTransport::raw_read supports key and prefix reads only".into(),
+                ))
+            }
+        };
+
+        let req = DbRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            operation: Some(db_request::Operation::RawRead(RawReadRequest {
+                target: Some(target),
+                commitment: commitment.to_vec(),
+            })),
+        };
+
+        let resp = self.send_request(req).await?;
+        let Some(db_response::Result::RawRead(raw_resp)) = resp.result else {
+            return Err(SdkError::DatabaseError(
+                "unexpected response type for raw_read".into(),
+            ));
+        };
+
+        // Verify against the client's own commitment. A key read proves
+        // inclusion; a prefix read proves the *complete* range, so the server
+        // cannot omit a child from a listing. A mismatch (e.g. the server
+        // advanced past `commitment`) surfaces as a verification error.
+        match op {
+            ReadOp::Key(key) => {
+                verify_proof(&raw_resp.proof, commitment, std::slice::from_ref(&key))
+            }
+            ReadOp::Prefix(prefix) => verify_prefix(&raw_resp.proof, commitment, &prefix),
+            ReadOp::Range { .. } => unreachable!("range reads are rejected above"),
         }
     }
 

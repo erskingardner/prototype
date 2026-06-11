@@ -5,6 +5,14 @@ license.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+mrt = [
+    "encrypted-spaces-backend/mrt",
+    "encrypted-spaces-ffproof/mrt",
+    "encrypted-spaces-sdk/mrt",
+]
+
 [dependencies]
 encrypted-spaces-acl-types = { workspace = true }
 encrypted-spaces-backend = { workspace = true }

@@ -23,8 +23,9 @@ use encrypted_spaces_backend::SpaceId;
 use encrypted_spaces_backend_server::app_config::{BootstrapDataSource, SpaceInitConfig};
 use encrypted_spaces_backend_server::SpaceState;
 use encrypted_spaces_changelog_core::changelog::{initial_clc_state, ChangeLog};
+use encrypted_spaces_sdk::native_op as sdk_tree_fs;
 use encrypted_spaces_sdk::schema::ApplicationSchema;
-use encrypted_spaces_sdk::{File, List, Space, TextArea};
+use encrypted_spaces_sdk::{tree_fs, File, List, Space, TextArea};
 use ff_common::SharedStateTransport;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -130,6 +131,7 @@ const FS_FILE_INSERT_SEED: u64 = 0xF5F1_1001;
 const FS_FILE_DELETE_SEED: u64 = 0xF5F1_1002;
 const FS_DIR_INSERT_SEED: u64 = 0xF5F1_1003;
 const FS_DIR_DELETE_SEED: u64 = 0xF5F1_1004;
+const FS_TREE_DIR_MOVE_SEED: u64 = 0xF5F1_1005;
 
 // Manual benchmark schema/version marker for result-file comparisons. Bump
 // this when the fixture, operation mix, or reporting semantics change.
@@ -250,7 +252,7 @@ async fn init_chat_state_and_space() -> (Arc<Mutex<SpaceState>>, Space) {
     let mut state = SpaceState::init_server(None, Some(init_cfg), Some(1_000_000_000))
         .await
         .expect("init_server");
-    state.tree_snapshot = state.db.snapshot();
+    state.tree_snapshot = state.db.checkpoint();
     let app_root = state.db.root_hash();
 
     let state = Arc::new(Mutex::new(state));
@@ -274,7 +276,7 @@ async fn reset_to_prepopulated_baseline(
         state.changelog = ChangeLog::new(&current_root);
         state.change_responses.clear();
         state.ff_proof = None;
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
         // Mirror `reinitialize_changelog`: clear the per-user sigref view
         // alongside the changelog reset, for symmetry with the production
         // path and to keep this baseline reset future-proof.
@@ -290,7 +292,7 @@ async fn reset_to_prepopulated_baseline(
                 .tree_snapshot
                 .as_ref()
                 .expect("tree_snapshot after prepopulation reset")
-                .hash(),
+                .root_hash(),
             current_root
         );
 
@@ -914,10 +916,34 @@ const FS_CASES: &[(&str, usize)] = &[
     ("fs_file_insert_10", 10),
     ("fs_file_delete", 1),
     ("fs_file_delete_10", 10),
+    // Native-op siblings of the file cases: the same edit driven through the
+    // hardcoded `add_inode` / `delete_inode_recursive` verifiers instead of the
+    // data-driven action, so their proof cycles sit beside the wrapper rows.
+    ("fs_file_insert_native", 1),
+    ("fs_file_insert_native_10", 10),
+    ("fs_file_delete_native", 1),
+    ("fs_file_delete_native_10", 10),
     ("fs_directory_insert", 1),
     ("fs_directory_insert_10", 10),
     ("fs_directory_delete", 1),
     ("fs_directory_delete_10", 10),
+    // Tree-fs backend (Phase B): the same shape stored as relative-inode /_fs
+    // records via the tree-fs native ops — the cross-surface comparison rows.
+    ("fs_tree_file_insert", 1),
+    ("fs_tree_file_insert_10", 10),
+    ("fs_tree_file_delete", 1),
+    ("fs_tree_file_delete_10", 10),
+    ("fs_tree_directory_insert", 1),
+    ("fs_tree_directory_insert_10", 10),
+    ("fs_tree_directory_move", 1),
+    ("fs_tree_directory_move_10", 10),
+    ("fs_tree_directory_delete", 1),
+    ("fs_tree_directory_delete_10", 10),
+    // Directory listing — a READ, so the metric is keys scanned (read
+    // amplification), not prove cycles. One case lists a directory at every
+    // fixture level (1..=4) from a single fixture, showing the new one-level scan
+    // cost vs the whole-subtree scan the replaced flat codec had to perform.
+    ("fs_tree_directory_list", 1),
 ];
 
 /// Select chat and filesystem cases from an optional positional filter.
@@ -1296,6 +1322,61 @@ async fn run_fs_file_delete(fixture: &FsFixture, n: usize) -> FsRunStats {
     FsRunStats { ops: n, ff_changes }
 }
 
+async fn run_fs_file_insert_native(fixture: &FsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.dir_ids.len(),
+        "cannot insert {n} files with unique seeded parents"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let parent_indices = pick_indices(fixture.dir_ids.len(), n, FS_FILE_INSERT_SEED);
+
+    for (i, &parent_idx) in parent_indices.iter().enumerate() {
+        let ts = fs_timestamp(FS_DIRS + FS_FILES + i);
+        fixture
+            .space
+            .submit_add_inode_native(
+                fixture.dir_ids[parent_idx],
+                AUTH_UID,
+                &format!("bench-file-insert-{i:02}.bin"),
+                INODE_FILE,
+                2_048,
+                ts,
+                ts,
+                "application/octet-stream",
+                File::from_hash(fs_inserted_file_hash(i)),
+            )
+            .await
+            .expect("native add_inode (file)");
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "native file insert ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_file_delete_native(fixture: &FsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.file_ids.len(),
+        "cannot delete {n} unique seeded files"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let file_indices = pick_indices(fixture.file_ids.len(), n, FS_FILE_DELETE_SEED);
+
+    // `delete_inode_recursive` on a leaf file deletes exactly that one row (it
+    // has no children) — the native analog of the raw single-inode delete.
+    for &file_idx in &file_indices {
+        fixture
+            .space
+            .submit_delete_inode_recursive_native(fixture.file_ids[file_idx])
+            .await
+            .expect("native delete_inode_recursive (file)");
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "native file delete ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
 async fn run_fs_directory_insert(fixture: &FsFixture, n: usize) -> FsRunStats {
     assert!(
         n <= fixture.dir_ids.len(),
@@ -1563,6 +1644,8 @@ async fn run_fs_case(case: &str, n: usize, fixture: &FsFixture) -> FsRunStats {
     match strip_numeric_suffix(case) {
         "fs_file_insert" => run_fs_file_insert(fixture, n).await,
         "fs_file_delete" => run_fs_file_delete(fixture, n).await,
+        "fs_file_insert_native" => run_fs_file_insert_native(fixture, n).await,
+        "fs_file_delete_native" => run_fs_file_delete_native(fixture, n).await,
         "fs_directory_insert" => run_fs_directory_insert(fixture, n).await,
         "fs_directory_delete" => run_fs_directory_delete(fixture, n).await,
         other => panic!("unknown filesystem case: {other}"),
@@ -1590,36 +1673,25 @@ async fn build_fs_cycles(selected_cases: &[&'static str]) -> HashMap<&'static st
             continue;
         }
         eprintln!("[fs] running {case} ...");
-        let fixture = init_prepopulated_fs_fixture().await;
-        let stats = run_fs_case(case, n, &fixture).await;
-        // `ProveResult` carries cycles, not a change count, so count the
-        // pending changes here (as the chat path does) and confirm the number
-        // of changes about to be proven equals the dynamically counted
-        // `ff_changes` before proving once.
-        let pending = {
-            let s = fixture.state.lock().await;
-            s.changelog.num_changes() as usize - s.changelog.proven_up_to
+        // Tree-fs cases build a `/_fs`-record fixture and run via the tree
+        // helpers; table cases use the `inodes` fixture. Both share the same
+        // prove-once-and-measure path (`prove_fs_stats`).
+        let metric = if is_fs_tree_list_case(case) {
+            // A read: no change to prove — measure keys scanned per listing.
+            let fixture = init_prepopulated_tree_fs_fixture().await;
+            run_fs_tree_directory_list(&fixture).await
+        } else if is_fs_tree_case(case) {
+            let fixture = init_prepopulated_tree_fs_fixture().await;
+            let stats = run_fs_tree_case(case, n, &fixture).await;
+            prove_fs_stats(case, stats, &fixture.state, &fixture.bench_chain).await
+        } else {
+            let fixture = init_prepopulated_fs_fixture().await;
+            let stats = run_fs_case(case, n, &fixture).await;
+            prove_fs_stats(case, stats, &fixture.state, &fixture.bench_chain).await
         };
-        assert_eq!(
-            pending, stats.ff_changes,
-            "fs case {case}: pending change count must equal counted ff_changes"
-        );
-        let prove = prove_fixture_pending_changes(&fixture.state, &fixture.bench_chain).await;
-        eprintln!("[ff-fs-result] {case}");
-        eprintln!("  ops: {}", stats.ops);
-        eprintln!("  cycles:");
-        eprintln!("    total: {}", prove.cycles);
-        if let Some(bench) = prove.bench.as_ref() {
-            ff_common::print_bench_timing(case, bench);
-        }
-        metrics.insert(
-            case,
-            FsMetric {
-                ops: stats.ops,
-                cycles: prove.cycles,
-            },
-        );
-        // `fixture` is dropped here, discarding the dataset before the next case.
+        metrics.insert(case, metric);
+        // The fixture is dropped at the end of each branch, discarding the
+        // dataset before the next case builds a fresh one.
     }
 
     eprintln!("[fs] all filesystem cases done in {:.2?}", t0.elapsed());
@@ -2099,6 +2171,537 @@ fn build_fs_report_parts(
         new: Some(render_fs_table(&new_rows)),
         old: Some(render_fs_table(previous)),
         delta: Some(render_fs_delta_table(&new_rows, previous)),
+    }
+}
+
+// ─── Tree-fs benchmark dimension (Phase B / P7) ──────────────────────────────
+// The same deterministic FS shape as the table backend, but stored as `/dir` +
+// `/info` inode-id /_fs records written by the tree-fs native ops, so its proof
+// cycles sit beside the data-driven and *_native table rows.
+
+struct TreeFsFixture {
+    state: Arc<Mutex<SpaceState>>,
+    bench_chain: Arc<Mutex<ff_common::BenchProofChain>>,
+    space: Space,
+    #[allow(dead_code)]
+    baseline_root: [u8; 32],
+    dir_handles: Vec<tree_fs::InodePath>,
+    #[allow(dead_code)]
+    dir_parent_handles: Vec<tree_fs::InodePath>,
+    dir_levels: Vec<u8>,
+    #[allow(dead_code)]
+    dir_children: Vec<Vec<usize>>,
+    file_handles: Vec<tree_fs::InodePath>,
+    #[allow(dead_code)]
+    file_parent_dir_indices: Vec<usize>,
+    level2_dir_indices: Vec<usize>,
+}
+
+fn auth_uid_u32() -> u32 {
+    u32::try_from(AUTH_UID).expect("AUTH_UID fits in u32")
+}
+
+fn tree_fs_folder_ref() -> Vec<u8> {
+    "0".repeat(64).into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_tree_fs_node(
+    space: &Space,
+    parent: &[tree_fs::InodeId],
+    kind: tree_fs::NodeKind,
+    name: String,
+    size: i64,
+    ctime: i64,
+    mtime: i64,
+    _mime_type: &str,
+    file_ref: Vec<u8>,
+) -> tree_fs::InodeId {
+    let handle = space
+        .submit_tree_fs_create_native(
+            parent.to_vec(),
+            auth_uid_u32(),
+            kind,
+            name.into_bytes(),
+            u64::try_from(size).expect("tree fs size must be nonnegative"),
+            ctime,
+            mtime,
+            tree_fs_hash_from_ref(file_ref),
+        )
+        .await
+        .expect("tree_fs_create native");
+    assert_eq!(
+        handle.len(),
+        parent.len() + 1,
+        "created tree-fs handle depth"
+    );
+    assert_eq!(
+        &handle[..parent.len()],
+        parent,
+        "created tree-fs handle parent prefix"
+    );
+    handle[parent.len()]
+}
+
+fn tree_fs_hash_from_ref(file_ref: Vec<u8>) -> [u8; tree_fs::CONTENT_HASH_LEN] {
+    let hex = std::str::from_utf8(&file_ref).expect("tree fs file ref is utf8 hex");
+    sdk_tree_fs::tree_fs_content_hash_from_hex(hex).expect("tree fs file ref is a raw-32 hex hash")
+}
+
+async fn assert_prepopulated_tree_fs_rows_visible(
+    state: &Arc<Mutex<SpaceState>>,
+    expected_child: &[tree_fs::InodeId],
+    expected_child_name: &str,
+) {
+    let prefix = tree_fs::encode_container_prefix(&[]).expect("tree root container prefix");
+    let rows = {
+        let state = state.lock().await;
+        state
+            .db
+            .iter_prefix_entries(&prefix)
+            .expect("raw read tree filesystem prefix")
+    };
+
+    let mut dir_count = 0usize;
+    let mut file_count = 0usize;
+    let mut sentinel_count = 0usize;
+    let mut saw_expected_child = false;
+
+    for (key, value) in rows {
+        let path = match tree_fs::decode_record_key::<tree_fs::InodePath>(&key) {
+            Ok(path) => path,
+            Err(_) if key.ends_with(b"/cnt") => {
+                sentinel_count += 1;
+                assert_eq!(value, b"1", "tree filesystem directory sentinel value");
+                continue;
+            }
+            Err(err) => panic!("decode tree filesystem record key: {err}"),
+        };
+        let record = tree_fs::Inode::decode(&value).expect("decode tree filesystem record");
+        match record.kind().expect("tree filesystem record kind") {
+            tree_fs::NodeKind::Directory => dir_count += 1,
+            tree_fs::NodeKind::File => file_count += 1,
+        }
+        if path == expected_child {
+            saw_expected_child = true;
+            assert_eq!(record.name, expected_child_name.as_bytes());
+        }
+    }
+
+    assert!(
+        saw_expected_child,
+        "expected tree child {expected_child:?} visible after reset"
+    );
+    assert_eq!(dir_count, FS_DIRS, "seeded tree directory records");
+    assert_eq!(file_count, FS_FILES, "seeded tree file records");
+    assert_eq!(
+        sentinel_count, FS_DIRS,
+        "seeded tree directory container sentinels"
+    );
+    assert_eq!(
+        dir_count + file_count,
+        FS_DIRS + FS_FILES,
+        "total seeded tree records"
+    );
+}
+
+/// Build the same deterministic filesystem shape as `init_prepopulated_fs_fixture`,
+/// but with `/dir` + `/info` inode-id tree-FS records under the raw `/_fs` key
+/// namespace.
+async fn init_prepopulated_tree_fs_fixture() -> TreeFsFixture {
+    let (state, space) = init_chat_state_and_space().await;
+
+    space
+        .table::<UsersMeta>("users_meta")
+        .insert(&UsersMeta {
+            id: Some(AUTH_UID),
+            name: "bench-user".to_string(),
+        })
+        .execute()
+        .await
+        .expect("seed users_meta insert execute");
+
+    let mut ts_counter = 0usize;
+    let mut dir_handles: Vec<tree_fs::InodePath> = Vec::with_capacity(FS_DIRS);
+    let mut dir_parent_handles: Vec<tree_fs::InodePath> = Vec::with_capacity(FS_DIRS);
+    let mut dir_levels: Vec<u8> = Vec::with_capacity(FS_DIRS);
+    let mut dir_children: Vec<Vec<usize>> = Vec::with_capacity(FS_DIRS);
+    let mut level2_dir_indices: Vec<usize> = Vec::with_capacity(FS_LEVEL2_DIRS);
+
+    let mut current_level: Vec<usize> = Vec::with_capacity(FS_BRANCHING);
+    for ordinal in 0..FS_BRANCHING {
+        let ts = fs_timestamp(ts_counter);
+        ts_counter += 1;
+        let child_id = create_tree_fs_node(
+            &space,
+            &[],
+            tree_fs::NodeKind::Directory,
+            fs_dir_name(1, ordinal),
+            0,
+            ts,
+            ts,
+            "",
+            tree_fs_folder_ref(),
+        )
+        .await;
+        let handle = vec![child_id];
+        assert_eq!(handle.len(), 1, "level-1 tree directory depth");
+        let idx = dir_handles.len();
+        dir_handles.push(handle);
+        dir_parent_handles.push(Vec::new());
+        dir_levels.push(1);
+        dir_children.push(Vec::new());
+        current_level.push(idx);
+    }
+
+    for level in 2..=FS_LEVELS {
+        let mut next_level: Vec<usize> = Vec::with_capacity(current_level.len() * FS_BRANCHING);
+        let mut ordinal = 0usize;
+        for &parent_idx in &current_level {
+            let parent = dir_handles[parent_idx].clone();
+            for _ in 0..FS_BRANCHING {
+                let ts = fs_timestamp(ts_counter);
+                ts_counter += 1;
+                let child_id = create_tree_fs_node(
+                    &space,
+                    &parent,
+                    tree_fs::NodeKind::Directory,
+                    fs_dir_name(level, ordinal),
+                    0,
+                    ts,
+                    ts,
+                    "",
+                    tree_fs_folder_ref(),
+                )
+                .await;
+                let mut handle = parent.clone();
+                handle.push(child_id);
+                assert_eq!(handle.len(), level, "tree directory depth");
+                let idx = dir_handles.len();
+                dir_handles.push(handle);
+                dir_parent_handles.push(parent.clone());
+                dir_levels.push(level as u8);
+                dir_children.push(Vec::new());
+                dir_children[parent_idx].push(idx);
+                if level == 2 {
+                    level2_dir_indices.push(idx);
+                }
+                next_level.push(idx);
+                ordinal += 1;
+            }
+        }
+        current_level = next_level;
+    }
+
+    let mut dir_file_handles: Vec<Vec<tree_fs::InodePath>> = Vec::with_capacity(dir_handles.len());
+    let mut file_handles: Vec<tree_fs::InodePath> = Vec::with_capacity(FS_FILES);
+    let mut file_parent_dir_indices: Vec<usize> = Vec::with_capacity(FS_FILES);
+    for (dir_idx, parent) in dir_handles.iter().enumerate() {
+        let mut these_files: Vec<tree_fs::InodePath> = Vec::with_capacity(FS_FILES_PER_DIR);
+        for file_idx in 0..FS_FILES_PER_DIR {
+            let ts = fs_timestamp(ts_counter);
+            ts_counter += 1;
+            let child_id = create_tree_fs_node(
+                &space,
+                parent,
+                tree_fs::NodeKind::File,
+                fs_file_name(dir_idx, file_idx),
+                1_024,
+                ts,
+                ts,
+                "application/octet-stream",
+                fs_file_hash(dir_idx, file_idx).into_bytes(),
+            )
+            .await;
+            let mut handle = parent.clone();
+            handle.push(child_id);
+            assert_eq!(
+                handle.len(),
+                parent.len() + 1,
+                "tree file depth under parent"
+            );
+            these_files.push(handle.clone());
+            file_handles.push(handle);
+            file_parent_dir_indices.push(dir_idx);
+        }
+        dir_file_handles.push(these_files);
+    }
+
+    assert_eq!(dir_handles.len(), FS_DIRS, "seeded tree directory count");
+    assert_eq!(
+        level2_dir_indices.len(),
+        FS_LEVEL2_DIRS,
+        "level-2 tree directory count"
+    );
+    assert_eq!(file_handles.len(), FS_FILES, "seeded tree file count");
+
+    let (space, baseline_root) = reset_to_prepopulated_baseline(&state, space).await;
+    assert_prepopulated_tree_fs_rows_visible(&state, &dir_file_handles[0][0], &fs_file_name(0, 0))
+        .await;
+
+    TreeFsFixture {
+        state,
+        bench_chain: Arc::new(Mutex::new(ff_common::BenchProofChain::new())),
+        space,
+        baseline_root,
+        dir_handles,
+        dir_parent_handles,
+        dir_levels,
+        dir_children,
+        file_handles,
+        file_parent_dir_indices,
+        level2_dir_indices,
+    }
+}
+
+async fn run_fs_tree_file_insert(fixture: &TreeFsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.dir_handles.len(),
+        "cannot insert {n} tree files with unique seeded parents"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let parent_indices = pick_indices(fixture.dir_handles.len(), n, FS_FILE_INSERT_SEED);
+
+    for (i, &parent_idx) in parent_indices.iter().enumerate() {
+        let ts = fs_timestamp(FS_DIRS + FS_FILES + i);
+        create_tree_fs_node(
+            &fixture.space,
+            &fixture.dir_handles[parent_idx],
+            tree_fs::NodeKind::File,
+            format!("bench-file-insert-{i:02}.bin"),
+            2_048,
+            ts,
+            ts,
+            "application/octet-stream",
+            fs_inserted_file_hash(i).into_bytes(),
+        )
+        .await;
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "tree file insert ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_tree_file_delete(fixture: &TreeFsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.file_handles.len(),
+        "cannot delete {n} unique seeded tree files"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let file_indices = pick_indices(fixture.file_handles.len(), n, FS_FILE_DELETE_SEED);
+
+    for &file_idx in &file_indices {
+        let deleted = fixture
+            .space
+            .submit_tree_fs_delete_native(fixture.file_handles[file_idx].clone())
+            .await
+            .expect("tree file delete");
+        assert_eq!(deleted, 1, "tree file delete rows_affected");
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "tree file delete ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_tree_directory_insert(fixture: &TreeFsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.dir_handles.len(),
+        "cannot insert {n} tree directories with unique seeded parents"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let parent_indices = pick_indices(fixture.dir_handles.len(), n, FS_DIR_INSERT_SEED);
+
+    for (i, &parent_idx) in parent_indices.iter().enumerate() {
+        let ts = fs_timestamp(FS_DIRS + FS_FILES + 10_000 + i);
+        create_tree_fs_node(
+            &fixture.space,
+            &fixture.dir_handles[parent_idx],
+            tree_fs::NodeKind::Directory,
+            format!("bench-dir-insert-{i:02}"),
+            0,
+            ts,
+            ts,
+            "",
+            tree_fs_folder_ref(),
+        )
+        .await;
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "tree directory insert ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_tree_directory_move(fixture: &TreeFsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.level2_dir_indices.len(),
+        "cannot move {n} distinct level-2 tree subtrees"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let target_positions = pick_indices(fixture.level2_dir_indices.len(), n, FS_TREE_DIR_MOVE_SEED);
+
+    for (i, &target_pos) in target_positions.iter().enumerate() {
+        let target_idx = fixture.level2_dir_indices[target_pos];
+        assert_eq!(
+            fixture.dir_levels[target_idx], 2,
+            "tree directory move target level"
+        );
+        let moved = fixture
+            .space
+            .submit_tree_fs_move_native(
+                fixture.dir_handles[target_idx].clone(),
+                Vec::new(),
+                fs_timestamp(FS_DIRS + FS_FILES + 20_000 + i),
+            )
+            .await
+            .expect("tree directory move")
+            .expect("tree directory move must return a new handle");
+        assert_eq!(moved.len(), 1, "moved level-2 subtree lands under root");
+        assert_eq!(
+            moved[0],
+            *fixture.dir_handles[target_idx]
+                .last()
+                .expect("level-2 target has an inode id"),
+            "moved subtree keeps its accepted inode id"
+        );
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "tree directory move ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_tree_directory_delete(fixture: &TreeFsFixture, n: usize) -> FsRunStats {
+    assert!(
+        n <= fixture.level2_dir_indices.len(),
+        "cannot delete {n} distinct level-2 tree subtrees"
+    );
+    let before = fs_changelog_len(&fixture.state).await;
+    let target_positions = pick_indices(fixture.level2_dir_indices.len(), n, FS_DIR_DELETE_SEED);
+
+    for &target_pos in &target_positions {
+        let target_idx = fixture.level2_dir_indices[target_pos];
+        assert_eq!(
+            fixture.dir_levels[target_idx], 2,
+            "tree directory delete target level"
+        );
+        let deleted = fixture
+            .space
+            .submit_tree_fs_delete_native(fixture.dir_handles[target_idx].clone())
+            .await
+            .expect("tree directory delete");
+        // Native rows_affected counts accepted native changes. The verifier
+        // emits one DeletePrefix for the directory container plus the root
+        // record Delete.
+        assert_eq!(deleted, 1, "tree directory delete rows_affected");
+    }
+
+    let ff_changes = fs_changelog_len(&fixture.state).await - before;
+    assert_eq!(ff_changes, n, "tree directory delete ff changes");
+    FsRunStats { ops: n, ff_changes }
+}
+
+async fn run_fs_tree_case(case: &str, n: usize, fixture: &TreeFsFixture) -> FsRunStats {
+    match strip_numeric_suffix(case) {
+        "fs_tree_file_insert" => run_fs_tree_file_insert(fixture, n).await,
+        "fs_tree_file_delete" => run_fs_tree_file_delete(fixture, n).await,
+        "fs_tree_directory_insert" => run_fs_tree_directory_insert(fixture, n).await,
+        "fs_tree_directory_move" => run_fs_tree_directory_move(fixture, n).await,
+        "fs_tree_directory_delete" => run_fs_tree_directory_delete(fixture, n).await,
+        other => panic!("unknown tree filesystem case: {other}"),
+    }
+}
+
+fn is_fs_tree_case(case: &str) -> bool {
+    strip_numeric_suffix(case).starts_with("fs_tree_")
+}
+
+fn is_fs_tree_list_case(case: &str) -> bool {
+    case == "fs_tree_directory_list"
+}
+
+/// Measure directory *listings* at every fixture level (1..=4) from one fixture.
+/// Listing is a read, not a proven change, so the reported metric is **keys
+/// scanned**: the new one-level prefix (`CONTAINER(D) ‖ /info`, exactly the
+/// direct children) vs the whole-subtree prefix (`CONTAINER(D)`) that the
+/// replaced flat codec had to scan and filter. Each level is logged with its
+/// read-amplification factor; `FsMetric.cycles` carries the level-1 one-level
+/// key count as the representative listing cost so the summary row renders.
+async fn run_fs_tree_directory_list(fixture: &TreeFsFixture) -> FsMetric {
+    eprintln!("[ff-fs-result] fs_tree_directory_list (read — metric is keys scanned)");
+    let mut level1_one = 0usize;
+
+    for level in 1u8..=FS_LEVELS as u8 {
+        let Some(dir_idx) = fixture.dir_levels.iter().position(|&l| l == level) else {
+            continue;
+        };
+        let dir = &fixture.dir_handles[dir_idx];
+        let listing_prefix =
+            tree_fs::encode_children_listing_prefix(dir).expect("children listing prefix");
+        let subtree_prefix =
+            tree_fs::encode_container_prefix(dir).expect("subtree container prefix");
+
+        let (one_level, subtree) = {
+            let state = fixture.state.lock().await;
+            let one = state
+                .db
+                .iter_prefix_entries(&listing_prefix)
+                .expect("one-level listing scan")
+                .len();
+            let sub = state
+                .db
+                .iter_prefix_entries(&subtree_prefix)
+                .expect("whole-subtree scan")
+                .len();
+            (one, sub)
+        };
+        if level == 1 {
+            level1_one = one_level;
+        }
+        let amplification = subtree as f64 / one_level.max(1) as f64;
+        eprintln!(
+            "  level {level}: one-level (CONTAINER ‖ /info) = {one_level} keys, \
+             whole-subtree (flat-equiv) = {subtree} keys, amplification = {amplification:.0}x"
+        );
+    }
+
+    FsMetric {
+        ops: 1,
+        cycles: level1_one as u64,
+    }
+}
+
+async fn prove_fs_stats(
+    case: &'static str,
+    stats: FsRunStats,
+    state: &Arc<Mutex<SpaceState>>,
+    bench_chain: &Arc<Mutex<ff_common::BenchProofChain>>,
+) -> FsMetric {
+    // `ProveResult` carries cycles, not a change count, so count the
+    // pending changes here (as the chat path does) and confirm the number
+    // of changes about to be proven equals the dynamically counted
+    // `ff_changes` before proving once.
+    let pending = {
+        let s = state.lock().await;
+        s.changelog.num_changes() as usize - s.changelog.proven_up_to
+    };
+    assert_eq!(
+        pending, stats.ff_changes,
+        "fs case {case}: pending change count must equal counted ff_changes"
+    );
+    let prove = prove_fixture_pending_changes(state, bench_chain).await;
+    eprintln!("[ff-fs-result] {case}");
+    eprintln!("  ops: {}", stats.ops);
+    eprintln!("  cycles:");
+    eprintln!("    total: {}", prove.cycles);
+    if let Some(bench) = prove.bench.as_ref() {
+        ff_common::print_bench_timing(case, bench);
+    }
+    FsMetric {
+        ops: stats.ops,
+        cycles: prove.cycles,
     }
 }
 

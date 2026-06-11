@@ -15,6 +15,7 @@ use encrypted_spaces_backend_server::db::ServerError;
 use encrypted_spaces_backend_server::SpaceState;
 use encrypted_spaces_changelog_core::changelog::ChangeLog;
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -249,7 +250,7 @@ impl LocalTransport {
         state.changelog = ChangeLog::new(&current_root);
         state.change_responses.clear();
         state.ff_proof = None;
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
         // Mirror `reinitialize_changelog`: the per-user sigref view is
         // changelog-scoped, so reset it whenever the in-process server
         // resets its changelog baseline. Without this, prior accepted
@@ -306,7 +307,7 @@ impl LocalTransport {
         state.changelog = ChangeLog::new(&current_root);
         state.change_responses.clear();
         state.ff_proof = None;
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
         // Mirror `reinitialize_changelog`: clear the per-user sigref
         // view alongside the changelog reset (see `create_table`).
         state.sigref_map.clear();
@@ -363,6 +364,32 @@ impl Transport for LocalTransport {
             schemas,
             &select_response.hashed_values,
         )
+    }
+
+    async fn raw_read(&self, op: ReadOp, commitment: &[u8; 32]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let state = self.state.lock().await;
+        let root = state.db.root_hash();
+        if commitment != &root {
+            return Err(SdkError::FastForwardRequired {
+                reason: format!(
+                    "client data commitment does not match server root (client={}, server={})",
+                    hex::encode(commitment),
+                    hex::encode(root)
+                ),
+            });
+        }
+
+        match op {
+            ReadOp::Key(key) => Ok(state
+                .db
+                .get_value(&key)?
+                .map(|value| vec![(key, value)])
+                .unwrap_or_default()),
+            ReadOp::Prefix(prefix) => state.db.iter_prefix_entries(&prefix),
+            ReadOp::Range { .. } => Err(SdkError::ValidationError(
+                "LocalTransport::raw_read supports key and prefix reads only".into(),
+            )),
+        }
     }
 
     #[inline]

@@ -29,9 +29,7 @@ impl Space {
         self.authenticate(AuthContext::new(Some(user_id), self.id))
             .await
     }
-}
 
-impl Space {
     /// Re-authenticate the transport with the given auth context, updating
     /// local state. If the new context matches the current one, the transport
     /// reconnect is skipped.

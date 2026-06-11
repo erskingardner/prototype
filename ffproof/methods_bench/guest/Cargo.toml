@@ -8,6 +8,9 @@ methods = ["guest"]
 
 [workspace]
 
+[features]
+mrt = ["encrypted-spaces-changelog-core/mrt"]
+
 [dependencies]
 encrypted-spaces-changelog-core = { path = "../../changelog_core", default-features = false, features = ["bench-timing"] }
 risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std"] }

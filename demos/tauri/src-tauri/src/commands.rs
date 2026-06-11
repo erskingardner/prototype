@@ -5,25 +5,45 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use encrypted_spaces_sdk::{
-    load_trust_cert, List, Space, SpaceInvite, TextArea, WebSocketTransport,
+    load_trust_cert, List, SdkErrorType as SdkError, Space, SpaceInvite, TextArea,
+    WebSocketTransport,
 };
 
 use crate::broadcast::{start_broadcast_listener, start_ephemeral_listener};
 use crate::chat;
 use crate::files;
+use crate::files_tree::{self, FsHandle};
 use crate::state::{self, AppState, UserInfo};
 
 /// Shared handle to the optional log file, managed by Tauri.
 pub struct LogFile(pub Option<Arc<Mutex<std::fs::File>>>);
 
-/// Retry an SDK write once on `parent_clc mismatch` (concurrent write by
-/// another client caused a stale table commitment). Syncs first, then retries.
+/// True if `e` is a sync-and-retry-able stale-parent error. Both the data-driven
+/// path and native ops surface a stale/concurrent parent as
+/// `ServerError::StaleParent` → `SdkError::FastForwardRequired` (the table case
+/// displays "…: parent_clc mismatch…", the native case "…: native op stale
+/// parent…"). Match the variant structurally so both are caught; fall back to the
+/// display substrings in case a caller stringified the error before wrapping it.
+fn is_stale_parent_retryable(e: &anyhow::Error) -> bool {
+    if matches!(
+        e.downcast_ref::<SdkError>(),
+        Some(SdkError::FastForwardRequired { .. })
+    ) {
+        return true;
+    }
+    let s = e.to_string();
+    s.contains("Fast forward required") || s.contains("parent_clc mismatch")
+}
+
+/// Retry an SDK write once when a concurrent write left the client behind
+/// (stale parent / fast-forward required — both data-driven and native ops).
+/// Syncs first, then retries.
 macro_rules! with_clc_retry {
     ($space:expr, $label:expr, $op:expr) => {
         match $op.await {
             Ok(v) => Ok(v),
-            Err(e) if e.to_string().contains("parent_clc mismatch") => {
-                log::warn!("[{}] parent_clc mismatch, syncing and retrying", $label);
+            Err(e) if is_stale_parent_retryable(&e) => {
+                log::warn!("[{}] stale parent, syncing and retrying", $label);
                 $space
                     .sync()
                     .await
@@ -721,7 +741,7 @@ pub async fn send_message_with_attachments(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mime_type = mime_from_extension(&filename);
+        let mime_type = crate::files::mime_from_extension(&filename);
         files.push(chat::PendingAttachment {
             data,
             filename,
@@ -784,34 +804,6 @@ fn file_cache_dir(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> 
         .join("file_cache");
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create file cache dir: {e}"))?;
     Ok(dir)
-}
-
-fn mime_from_extension(filename: &str) -> String {
-    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "bmp" => "image/bmp",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        "flac" => "audio/flac",
-        "aac" => "audio/aac",
-        "m4a" => "audio/mp4",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        "gz" | "tar" => "application/gzip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }
 
 // ─── Calendar Commands ──────────────────────────────────────────────────────
@@ -938,7 +930,7 @@ pub async fn upload_inodes(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mime_type = mime_from_extension(&filename);
+        let mime_type = crate::files::mime_from_extension(&filename);
         pending.push(crate::files::PendingFile {
             data,
             filename,
@@ -948,8 +940,8 @@ pub async fn upload_inodes(
 
     match crate::files::upload_files(&space, parent_id, author_id, pending).await {
         Ok(inodes) => Ok(inodes),
-        Err(e) if e.to_string().contains("parent_clc mismatch") => {
-            log::warn!("[inodes] upload: parent_clc mismatch, syncing and retrying");
+        Err(e) if is_stale_parent_retryable(&e) => {
+            log::warn!("[inodes] upload: stale parent, syncing and retrying");
             space
                 .sync()
                 .await
@@ -964,7 +956,7 @@ pub async fn upload_inodes(
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let mime_type = mime_from_extension(&filename);
+                let mime_type = crate::files::mime_from_extension(&filename);
                 pending2.push(crate::files::PendingFile {
                     data,
                     filename,
@@ -1047,6 +1039,202 @@ pub async fn rename_inode(
     )
 }
 
+// ─── Tree Filesystem (serialized-handle) Commands ─────────────────────────────
+//
+// A Tauri-callable path for the relative-inode ("tree") backend. Inode identity
+// here is the hierarchical `FsHandleWire = string[]` handle — each element a
+// 64-char hex inode id, root is `[]` — not the table backend's i64 row id.
+// `FsHandle::from_wire` validates and hex-decodes the handle, so it is fallible
+// here (a malformed handle is a command error). The table inode commands above
+// stay registered alongside these.
+
+/// Read and size-check files from disk into `PendingFile`s for upload. Shared by
+/// the table and tree upload commands.
+fn read_pending_files(file_paths: &[String]) -> Result<Vec<files::PendingFile>, String> {
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MiB
+
+    let mut pending = Vec::with_capacity(file_paths.len());
+    for path in file_paths {
+        let metadata =
+            std::fs::metadata(path).map_err(|e| format!("failed to read file {path}: {e}"))?;
+        if metadata.len() > MAX_FILE_SIZE {
+            let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+            return Err(format!(
+                "File too large: {} is {:.1} MB (max 50 MB)",
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path),
+                size_mb
+            ));
+        }
+        let data = std::fs::read(path).map_err(|e| format!("failed to read file {path}: {e}"))?;
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let mime_type = files::mime_from_extension(&filename);
+        pending.push(files::PendingFile {
+            data,
+            filename,
+            mime_type,
+        });
+    }
+    Ok(pending)
+}
+
+#[tauri::command]
+pub async fn list_inodes_tree(
+    state: State<'_, AppState>,
+    parent: files_tree::FsHandleWire,
+) -> Result<Vec<files_tree::TreeInodeWithAuthor>, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let parent = FsHandle::from_wire(parent).map_err(|e| format!("invalid tree handle: {e}"))?;
+    files_tree::list_children_tree(&space, parent)
+        .await
+        .map_err(|e| format!("list tree inodes failed: {e}"))
+}
+
+#[tauri::command]
+pub async fn upload_inodes_tree(
+    state: State<'_, AppState>,
+    file_paths: Vec<String>,
+    parent: files_tree::FsHandleWire,
+) -> Result<Vec<files_tree::TreeInode>, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let author_id = {
+        let user_guard = state.user_info.lock().await;
+        user_guard.as_ref().ok_or("user not initialized")?.user_id
+    };
+
+    let parent = FsHandle::from_wire(parent).map_err(|e| format!("invalid tree handle: {e}"))?;
+    match files_tree::upload_files_tree(
+        &space,
+        parent.clone(),
+        author_id,
+        read_pending_files(&file_paths)?,
+    )
+    .await
+    {
+        Ok(inodes) => Ok(inodes),
+        Err(e) if is_stale_parent_retryable(&e) => {
+            log::warn!("[tree-inodes] upload: stale parent, syncing and retrying");
+            space
+                .sync()
+                .await
+                .map_err(|e| format!("sync failed: {e}"))?;
+            files_tree::upload_files_tree(
+                &space,
+                parent,
+                author_id,
+                read_pending_files(&file_paths)?,
+            )
+            .await
+            .map_err(|e| format!("upload tree inodes failed after retry: {e}"))
+        }
+        Err(e) => Err(format!("upload tree inodes failed: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn create_folder_inode_tree(
+    state: State<'_, AppState>,
+    parent: files_tree::FsHandleWire,
+    name: String,
+) -> Result<files_tree::TreeInode, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let author_id = {
+        let user_guard = state.user_info.lock().await;
+        user_guard.as_ref().ok_or("user not initialized")?.user_id
+    };
+    let parent = FsHandle::from_wire(parent).map_err(|e| format!("invalid tree handle: {e}"))?;
+    with_clc_retry!(
+        space,
+        "tree-inodes",
+        files_tree::create_folder_tree(&space, parent.clone(), author_id, &name)
+    )
+}
+
+#[tauri::command]
+pub async fn delete_inode_tree(
+    state: State<'_, AppState>,
+    id: files_tree::FsHandleWire,
+) -> Result<bool, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let id = FsHandle::from_wire(id).map_err(|e| format!("invalid tree handle: {e}"))?;
+    with_clc_retry!(
+        space,
+        "tree-inodes",
+        files_tree::delete_inode_recursive_tree(&space, id.clone())
+    )
+}
+
+#[tauri::command]
+pub async fn move_inode_tree(
+    state: State<'_, AppState>,
+    id: files_tree::FsHandleWire,
+    new_parent: files_tree::FsHandleWire,
+) -> Result<files_tree::MoveInodeResult, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let id = FsHandle::from_wire(id).map_err(|e| format!("invalid tree handle: {e}"))?;
+    let new_parent =
+        FsHandle::from_wire(new_parent).map_err(|e| format!("invalid tree handle: {e}"))?;
+    with_clc_retry!(
+        space,
+        "tree-inodes",
+        files_tree::move_inode_tree(&space, id.clone(), new_parent.clone())
+    )
+}
+
+#[tauri::command]
+pub async fn rename_inode_tree(
+    state: State<'_, AppState>,
+    id: files_tree::FsHandleWire,
+    new_name: String,
+) -> Result<bool, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let id = FsHandle::from_wire(id).map_err(|e| format!("invalid tree handle: {e}"))?;
+    with_clc_retry!(
+        space,
+        "tree-inodes",
+        files_tree::rename_inode_tree(&space, id.clone(), &new_name)
+    )
+}
+
+#[tauri::command]
+pub async fn download_file_tree(
+    state: State<'_, AppState>,
+    id: files_tree::FsHandleWire,
+) -> Result<Vec<u8>, String> {
+    let space = {
+        let guard = state.space.lock().await;
+        Arc::clone(guard.as_ref().ok_or("space not initialized")?)
+    };
+    let id = FsHandle::from_wire(id).map_err(|e| format!("invalid tree handle: {e}"))?;
+    files_tree::download_file_tree(&space, id)
+        .await
+        .map_err(|e| format!("download tree file failed: {e}"))
+}
+
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1094,6 +1282,40 @@ pub fn log_message(log_file: State<'_, LogFile>, level: String, message: String)
 
 #[cfg(test)]
 mod tests {
+    use super::{is_stale_parent_retryable, SdkError};
+
+    #[test]
+    fn stale_parent_retry_matches_native_and_table_fast_forward() {
+        // Native op stale parent and the data-driven path both surface as
+        // SdkError::FastForwardRequired — both must be retryable.
+        let native: anyhow::Error = SdkError::FastForwardRequired {
+            reason: "native op stale parent: ...".to_string(),
+        }
+        .into();
+        assert!(is_stale_parent_retryable(&native));
+
+        let table: anyhow::Error = SdkError::FastForwardRequired {
+            reason: "parent_clc mismatch: change claims ...".to_string(),
+        }
+        .into();
+        assert!(is_stale_parent_retryable(&table));
+
+        // String fallback (in case an SdkError is stringified before wrapping).
+        assert!(is_stale_parent_retryable(&anyhow::anyhow!(
+            "Fast forward required: native op stale parent: ..."
+        )));
+        assert!(is_stale_parent_retryable(&anyhow::anyhow!(
+            "parent_clc mismatch: ..."
+        )));
+
+        // The distinct FF variant and unrelated errors are NOT retried here.
+        let advanced: anyhow::Error = SdkError::FastForwardStateAdvanced.into();
+        assert!(!is_stale_parent_retryable(&advanced));
+        assert!(!is_stale_parent_retryable(&anyhow::anyhow!(
+            "record not found"
+        )));
+    }
+
     #[test]
     fn app_schema_bytes_parse() {
         let text =

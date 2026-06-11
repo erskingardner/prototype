@@ -34,12 +34,14 @@
 
 pub mod action;
 pub mod actor;
+pub mod cold_read;
 pub mod fuzz;
 pub mod runner;
 pub mod world;
 
 pub use action::{Action, Scenario, Step};
 pub use actor::Actor;
+pub use cold_read::{assert_cold_read, assert_tree_cold_read, two_actor_world};
 pub use fuzz::{FuzzConfig, FuzzGenerator};
 pub use runner::{FailureReport, Runner, RunnerError};
 pub use world::World;

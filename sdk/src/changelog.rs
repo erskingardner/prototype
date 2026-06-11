@@ -19,7 +19,7 @@ use encrypted_spaces_changelog_core::time::{
     validate_accepted_at_server_time_against_local_clock, validate_change_timestamp_at_acceptance,
     validate_timestamp_hwm, TIMESTAMP_HWM_TOLERANCE_SECONDS,
 };
-use encrypted_spaces_changelog_core::BatchOp;
+use encrypted_spaces_changelog_core::WriteOp;
 use encrypted_spaces_storage_encoding::{classify_insert_id, hashstore_hash, InsertId, HASH_LEN};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ pub(crate) struct CompletedChange {
     /// `None` when the entry was discharged via a fast-forward path (ragged
     /// apply or inclusion proof); in that case callers fall back to
     /// [`CompletedChange::ff_inserted_ids`] / a re-verified response.
-    pub(crate) sequential_writes: Option<Vec<BatchOp>>,
+    pub(crate) sequential_writes: Option<Vec<WriteOp>>,
     /// Row ids captured from ragged fast-forward application, keyed by entry
     /// signature. Empty for the sequential path.
     pub(crate) ff_inserted_ids: std::collections::BTreeMap<Vec<u8>, i64>,
@@ -120,7 +120,7 @@ pub(crate) struct CompletedChange {
 /// Internal carrier for the writes produced while discharging a pending
 /// change; folded into a [`CompletedChange`] by [`Space::submit_and_complete`].
 struct CompletionWrites {
-    sequential: Option<Vec<BatchOp>>,
+    sequential: Option<Vec<WriteOp>>,
     ff_inserted_ids: std::collections::BTreeMap<Vec<u8>, i64>,
 }
 
@@ -1162,7 +1162,7 @@ pub(crate) enum BroadcastApplyOutcome {
     Skipped,
     Applied {
         change: Change,
-        writes: Vec<BatchOp>,
+        writes: Vec<encrypted_spaces_changelog_core::WriteOp>,
     },
     AppliedCacheInvalidated,
 }
@@ -1359,12 +1359,14 @@ impl Space {
 
     /// Validate the pruned Merkle tree and apply the change response to client state.
     /// Returns `SdkError::FastForwardRequired` if the client is out-of-sync,
-    /// otherwise the per-op `BatchOp` writes from the verified proof.
+    /// otherwise the per-op `WriteOp` writes from the verified proof.
     pub fn validate_and_apply_change(
         &self,
-        change: &ChangelogEntry,
-        response: &ChangeResponse,
-    ) -> Result<Vec<BatchOp>> {
+        change: &encrypted_spaces_changelog_core::changelog::ChangelogEntry,
+        response: &encrypted_spaces_changelog_core::changelog::ChangeResponse,
+    ) -> Result<Vec<encrypted_spaces_changelog_core::WriteOp>> {
+        use encrypted_spaces_changelog_core::changelog::ChangeLog;
+
         // Read all state fields atomically in one lock to prevent races with
         // the broadcast listener (which can also call this method).
         // `expected_sig_ref` is the signer's last known change_id (0 if the
@@ -2281,7 +2283,8 @@ impl Space {
         // from advancing to an unverified state.
         let mut inserted_ids: std::collections::BTreeMap<Vec<u8>, i64> =
             std::collections::BTreeMap::new();
-        let mut ragged_cache_updates: Vec<(Change, Vec<BatchOp>)> = Vec::new();
+        let mut ragged_cache_updates: Vec<(Change, Vec<encrypted_spaces_changelog_core::WriteOp>)> =
+            Vec::new();
 
         for (change, response) in ff_data.changes.iter().zip(ff_data.responses.iter()) {
             let state_values = self.with_state(|state| {
@@ -2452,8 +2455,12 @@ impl Space {
             self.with_state_mut(|state| {
                 for (_, writes) in &ragged_cache_updates {
                     for op in writes {
-                        if let BatchOp::Put { key, .. } = op {
-                            if let Ok(ParsedKey::Column { ref table, .. }) = parse_key(key) {
+                        if let encrypted_spaces_changelog_core::WriteOp::Put { key, .. } = op {
+                            if let Ok(encrypted_spaces_backend::merk_storage::ParsedKey::Column {
+                                ref table,
+                                ..
+                            }) = encrypted_spaces_backend::merk_storage::parse_key(key)
+                            {
                                 if let Some(schema) = state.table_schemas.get(table) {
                                     let indexed = crate::cache::indexed_columns_for_schema(schema);
                                     state.cache.init_table(table, &indexed);

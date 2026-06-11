@@ -28,8 +28,23 @@ use encrypted_spaces_changelog_core::changelog::{
     ChangelogEntry, ChangelogError, FastForwardData, FastForwardProof, FastForwardServerHead,
     HashedValues, KvData, OpType, MAX_LOGMSG_ENTRIES, MAX_PARENT_DISTANCE,
 };
+// Native-op payload decoders + kind/version constants. The server never runs
+// the in-guest verifier here; it decodes the signed payload directly to learn
+// which hash-backed digests a native change references and which row a
+// missing-target op would touch (graceful no-op probe).
 use encrypted_spaces_changelog_core::ops::extract_row_id_from_invite_user_proof;
 use encrypted_spaces_changelog_core::time::validate_change_timestamp_at_acceptance;
+use encrypted_spaces_changelog_core::{
+    decode_add_inode_payload, decode_delete_inode_recursive_payload, decode_move_inode_payload,
+    decode_native_header, decode_rename_inode_payload, decode_tree_fs_inode_create_payload,
+    decode_tree_fs_inode_delete_payload, decode_tree_fs_inode_move_payload,
+    decode_tree_fs_inode_rename_payload, decode_update_message_payload, tree_fs, ADD_INODE_KIND,
+    ADD_INODE_VERSION, DELETE_INODE_RECURSIVE_KIND, DELETE_INODE_RECURSIVE_VERSION,
+    MOVE_INODE_KIND, MOVE_INODE_VERSION, RENAME_INODE_KIND, RENAME_INODE_VERSION,
+    TREE_FS_CREATE_KIND, TREE_FS_CREATE_VERSION, TREE_FS_DELETE_KIND, TREE_FS_DELETE_VERSION,
+    TREE_FS_MOVE_KIND, TREE_FS_MOVE_VERSION, TREE_FS_RENAME_KIND, TREE_FS_RENAME_VERSION,
+    UPDATE_MESSAGE_KIND, UPDATE_MESSAGE_VERSION,
+};
 use encrypted_spaces_crypto::signature::Ed25519Signature;
 use encrypted_spaces_crypto::KeyCommitment;
 use encrypted_spaces_crypto::Mkem;
@@ -42,6 +57,9 @@ use encrypted_spaces_key_manager::{
     InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest, SpaceKey,
 };
 use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
+use encrypted_spaces_storage_encoding::keys::{
+    column_key as storage_column_key, native_marker_key, native_payload_key,
+};
 use encrypted_spaces_storage_encoding::{action_storage_key, decode_action_value, hashstore_hash};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -112,12 +130,174 @@ fn resolve_from_hashed_values(value: &[u8], hashed_values: &HashedValues) -> Vec
     value.to_vec()
 }
 
+/// Decode the hashed values a native change references.
+///
+/// Native marker/payload kvs aren't `ParsedKey::Column` keys, so the generic
+/// column-scan in [`SpaceState::require_hashed_values_for_change`] /
+/// [`SpaceState::collect_hashed_values_for_change`] would miss any hash-backed
+/// content referenced from the payload. Content-free native kinds return an
+/// empty set explicitly.
+fn native_referenced_digests(change: &Change) -> Result<BTreeSet<[u8; 32]>, ServerError> {
+    let entries = &change.entry.message.entries;
+    let marker = entries
+        .first()
+        .ok_or_else(|| ServerError::Generic("native op: missing marker kv".to_string()))?;
+    let payload = entries
+        .get(1)
+        .ok_or_else(|| ServerError::Generic("native op: missing payload kv".to_string()))?;
+    let (kind, version) = decode_native_header(&marker.value)?;
+    match (kind, version) {
+        (UPDATE_MESSAGE_KIND, UPDATE_MESSAGE_VERSION) => {
+            let (_message_id, content_digest) = decode_update_message_payload(&payload.value)?;
+            Ok(BTreeSet::from([content_digest]))
+        }
+        (ADD_INODE_KIND, ADD_INODE_VERSION) => {
+            // The widest native insert references **two** hash-backed digests
+            // (`name`, `mime_type`); both ride in the sidecar so remote clients
+            // can resolve the new inode's name + mime. The `file_hash` fileref
+            // does NOT — it is a pre-uploaded blob hash in the file store, not a
+            // hash-store digest.
+            let p = decode_add_inode_payload(&payload.value)?;
+            Ok(BTreeSet::from([p.name_digest, p.mime_type_digest]))
+        }
+        (RENAME_INODE_KIND, RENAME_INODE_VERSION) => {
+            // Only `name` is hash-backed (digest in the payload, bytes in the
+            // sidecar); `mtime` is encrypted-but-not-hash-backed and never enters
+            // the sidecar — its ciphertext rides in the signed payload.
+            let (_inode_id, name_digest, _mtime) = decode_rename_inode_payload(&payload.value)?;
+            Ok(BTreeSet::from([name_digest]))
+        }
+        (MOVE_INODE_KIND, MOVE_INODE_VERSION) => {
+            // `parent_id` is plaintext and `mtime` is encrypted in-place, but
+            // neither column is hash-backed; a move carries no sidecar bytes.
+            let (_inode_id, _new_parent_id, _mtime) = decode_move_inode_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        (DELETE_INODE_RECURSIVE_KIND, DELETE_INODE_RECURSIVE_VERSION) => {
+            let _inode_id = decode_delete_inode_recursive_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        // Tree-fs inodes store their value bytes inline in the raw `/_fs`
+        // record, not via hash-backed columns — so no sidecar digests.
+        // Decode anyway to reject a malformed payload at the wire boundary.
+        (TREE_FS_CREATE_KIND, TREE_FS_CREATE_VERSION) => {
+            let (_parent, _inode) = decode_tree_fs_inode_create_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        (TREE_FS_RENAME_KIND, TREE_FS_RENAME_VERSION) => {
+            let (_path, _name, _mtime) = decode_tree_fs_inode_rename_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        (TREE_FS_MOVE_KIND, TREE_FS_MOVE_VERSION) => {
+            let (_source, _dest_parent, _mtime) =
+                decode_tree_fs_inode_move_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        (TREE_FS_DELETE_KIND, TREE_FS_DELETE_VERSION) => {
+            let _source = decode_tree_fs_inode_delete_payload(&payload.value)?;
+            Ok(BTreeSet::new())
+        }
+        _ => Err(ServerError::Generic(format!(
+            "native op: unknown native handler kind={kind} version={version}"
+        ))),
+    }
+}
+
+/// For native kinds whose data-driven sibling is a graceful no-op when the
+/// target row is absent (an UPDATE/DELETE matching no row), return a
+/// materialized non-id column key to probe. `None` for kinds that always
+/// proceed (inserts and content edits with their own existence checks).
+fn native_missing_target_probe_key(entry: &ChangelogEntry) -> Result<Option<Vec<u8>>, ServerError> {
+    let entries = &entry.message.entries;
+    let marker = entries
+        .first()
+        .ok_or_else(|| ServerError::Generic("native op: missing marker kv".to_string()))?;
+    let payload = entries
+        .get(1)
+        .ok_or_else(|| ServerError::Generic("native op: missing payload kv".to_string()))?;
+    let (kind, version) = decode_native_header(&marker.value)?;
+    if (kind, version) == (RENAME_INODE_KIND, RENAME_INODE_VERSION) {
+        // A missing inode must be a graceful no-op (rows_affected = 0), not an
+        // error — mirroring the data-driven UPDATE that matches no row. Probe a
+        // materialized non-id column (`type`, present on every inode); the PK
+        // `id` is the row key, never a stored column, so an `id` probe always
+        // reads absent.
+        let (inode_id, _name_digest, _mtime) = decode_rename_inode_payload(&payload.value)?;
+        return Ok(Some(storage_column_key("inodes", inode_id, "type")));
+    }
+    if (kind, version) == (MOVE_INODE_KIND, MOVE_INODE_VERSION) {
+        // A missing inode must be a graceful no-op (rows_affected = 0), not an
+        // error. Probe a materialized non-id column (`name`); the PK `id` is the
+        // row key, never a stored column, so an `id` probe always reads absent.
+        let (inode_id, _new_parent_id, _mtime) = decode_move_inode_payload(&payload.value)?;
+        return Ok(Some(storage_column_key("inodes", inode_id, "name")));
+    }
+    if (kind, version) == (DELETE_INODE_RECURSIVE_KIND, DELETE_INODE_RECURSIVE_VERSION) {
+        // A missing recursive-delete target is a graceful no-op, matching the
+        // raw `table.delete().where_eq("id", …)` path. Probe a materialized
+        // non-id column (`parent_id`); the PK `id` is the row key, never a
+        // stored column.
+        let inode_id = decode_delete_inode_recursive_payload(&payload.value)?;
+        return Ok(Some(storage_column_key("inodes", inode_id, "parent_id")));
+    }
+    // Tree-fs rename/move/delete on a missing record are graceful no-ops — probe
+    // the target's record key directly (tree-fs records live under raw `/_fs`
+    // keys, not table columns). Create has no probe: it errors on a missing
+    // parent rather than no-opping.
+    if (kind, version) == (TREE_FS_RENAME_KIND, TREE_FS_RENAME_VERSION) {
+        let (path, _name, _mtime) = decode_tree_fs_inode_rename_payload(&payload.value)?;
+        return tree_fs_probe_key(&path);
+    }
+    if (kind, version) == (TREE_FS_MOVE_KIND, TREE_FS_MOVE_VERSION) {
+        let (source, _dest_parent, _mtime) = decode_tree_fs_inode_move_payload(&payload.value)?;
+        return tree_fs_probe_key(&source);
+    }
+    if (kind, version) == (TREE_FS_DELETE_KIND, TREE_FS_DELETE_VERSION) {
+        let source = decode_tree_fs_inode_delete_payload(&payload.value)?;
+        return tree_fs_probe_key(&source);
+    }
+    Ok(None)
+}
+
+/// The raw `/_fs` record key for a tree-fs path, used as the missing-target
+/// probe (its absence in merk ⇒ graceful no-op).
+fn tree_fs_probe_key(path: &[tree_fs::InodeId]) -> Result<Option<Vec<u8>>, ServerError> {
+    tree_fs::encode_record_key(path)
+        .map(Some)
+        .map_err(|e| ServerError::Generic(format!("tree_fs native probe key: {e}")))
+}
+
+/// Kind-aware schema precondition for native `update_message`: the
+/// `messages.content` column must exist and be hash-backed (the payload
+/// carries only its digest). Other native kinds validate their own (or no)
+/// schema needs and are not checked here.
+fn ensure_native_update_message_schema(db: &MerkStorage) -> Result<(), ServerError> {
+    let schema = db.get_schema("messages").map_err(|_| {
+        ServerError::Generic(
+            "native update_message requires a registered messages schema".to_string(),
+        )
+    })?;
+    let Some(content_col) = schema.columns.iter().find(|c| c.name == "content") else {
+        return Err(ServerError::Generic(
+            "native update_message requires messages.content column".to_string(),
+        ));
+    };
+    if !content_col.column_type.is_hash_backed() {
+        return Err(ServerError::Generic(format!(
+            "native update_message requires messages.content to be hash-backed, got {:?}",
+            content_col.column_type
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn op_name(op: &Option<db_request::Operation>) -> &'static str {
     if op.is_none() {
         return "<None>";
     }
     match op.as_ref().unwrap() {
         db_request::Operation::Select(_) => "Select",
+        db_request::Operation::RawRead(_) => "RawRead",
         db_request::Operation::Change(_) => "Change",
         db_request::Operation::FastForward(_) => "FastForward",
         db_request::Operation::AddMember(_) => "AddMember",
@@ -138,7 +318,7 @@ pub struct SpaceState {
     pub ff_proof: Option<FFProof>,
     /// A copy of the tree at the time ff_proof was created. When we create the next proof,
     /// we need the tree and a list of operations we'll apply to it.
-    pub tree_snapshot: Option<merk::Node>,
+    pub tree_snapshot: Option<encrypted_spaces_backend::merk_storage::Checkpoint>,
     /// Batch size for FF proof generation - a new proof is generated every N changes
     pub ff_batch_size: usize,
     /// Per-recipient GK delivery slots (runtime state, not DB-persisted).
@@ -599,7 +779,7 @@ impl SpaceState {
 
         // Take tree snapshot AFTER demo inserts so it matches the state
         // the first tracked change will see as its old_root
-        new_server_state.tree_snapshot = new_server_state.db.snapshot();
+        new_server_state.tree_snapshot = new_server_state.db.checkpoint();
 
         log::info!(
             "space={sid} init complete, root={}",
@@ -1268,6 +1448,45 @@ impl SpaceState {
                     ))),
                 }
             }
+            OpType::Native => {
+                // Native ops carry exactly two kvs — the native marker
+                // (header) at position 0 and the raw op payload at position 1 —
+                // at the root tree_path. Validate that envelope shape here so a
+                // malformed entry fails fast; the per-op decode and ACL checks
+                // live in `NativeOp::extract_and_validate`. The generic
+                // key-parser below would reject these non-column keys outright.
+                if tree_path.as_slice() != b"/" {
+                    return Err(ServerError::Generic(format!(
+                        "Native op requires tree_path \"/\", got {:?}",
+                        String::from_utf8_lossy(tree_path)
+                    )));
+                }
+                if change.message.entries.len() != 2 {
+                    return Err(ServerError::Generic(format!(
+                        "Native op requires exactly 2 kvs (marker + payload), got {}",
+                        change.message.entries.len()
+                    )));
+                }
+                if change.message.entries[0].key != native_marker_key() {
+                    return Err(ServerError::Generic(
+                        "Native op's first kv must be the native marker".to_string(),
+                    ));
+                }
+                if change.message.entries[1].key != native_payload_key() {
+                    return Err(ServerError::Generic(
+                        "Native op's second kv must be the native payload".to_string(),
+                    ));
+                }
+                // Kind-aware schema precondition: only `update_message` requires a
+                // hash-backed `messages.content` column. Other native kinds
+                // validate their own (or no) schema needs, so don't reject them
+                // here — the envelope is already shape-checked above.
+                let (kind, version) = decode_native_header(&change.message.entries[0].value)?;
+                if (kind, version) == (UPDATE_MESSAGE_KIND, UPDATE_MESSAGE_VERSION) {
+                    ensure_native_update_message_schema(&self.db)?;
+                }
+                Ok(())
+            }
             _ => {
                 match tree_path.as_slice() {
                     b"/" => {
@@ -1748,6 +1967,34 @@ impl SpaceState {
                     DeleteValidationOutcome::NoMatchingRows => return Ok(None),
                 }
             }
+            OpType::Native => {
+                // Native ops use strict freshness: their parent must be the
+                // current server head. Unlike data-driven ops they cannot be
+                // rebased server-side (the signed payload encodes intent, not
+                // explicit kvs), so a stale parent is rejected outright rather
+                // than scanned for key conflicts. Surface this as `StaleParent`
+                // (not `Generic`) so the transport maps it to
+                // `FastForwardRequired` and the client can fast-forward and
+                // retry, matching the data-driven stale-parent path.
+                let server_head = self.changelog.num_changes();
+                if entry.parent_change != server_head {
+                    return Err(ServerError::StaleParent(format!(
+                        "native op stale parent: parent_change={} server_head={server_head}",
+                        entry.parent_change
+                    )));
+                }
+                // A native op whose target row is absent is a graceful no-op
+                // (rows_affected = 0), mirroring a data-driven UPDATE/DELETE that
+                // matches no row. Native delete_inode_recursive preserves
+                // Merk-state behavior only: unlike raw OpType::Delete it does not
+                // call collect_file_hashes_for_delete, so file-store GC for
+                // orphaned inode filerefs remains out of scope.
+                if let Some(probe_key) = native_missing_target_probe_key(entry)? {
+                    if self.db.get_value(&probe_key)?.is_none() {
+                        return Ok(None);
+                    }
+                }
+            }
             OpType::CreateSpace => {
                 self.server_validation_create_space(change, auth)?;
             }
@@ -1772,12 +2019,19 @@ impl SpaceState {
             }
         }
 
-        let pruned_merkle_tree = self
-            .db
-            .apply_change_with_pruned_tree(change, current_change_id)
-            .await?;
+        let pruned_merkle_tree = if entry.message.op_type == OpType::Native {
+            self.db
+                .apply_change_with_pruned_tree_or_native_noop(change, current_change_id)
+                .await?
+        } else {
+            Some(
+                self.db
+                    .apply_change_with_pruned_tree(change, current_change_id)
+                    .await?,
+            )
+        };
 
-        Ok(Some(AppliedChangeProof { pruned_merkle_tree }))
+        Ok(pruned_merkle_tree.map(|pruned_merkle_tree| AppliedChangeProof { pruned_merkle_tree }))
     }
 
     fn validate_hashed_values(&self, hashed_values: &HashedValues) -> Result<(), ServerError> {
@@ -1889,6 +2143,28 @@ impl SpaceState {
         use encrypted_spaces_storage_encoding::HASH_LEN;
 
         let op = change.entry.message.op_type;
+
+        // Native ops hash-back their content via the payload digest, not a
+        // hash-backed column kv, so the column-scan below can't see it. Decode
+        // the referenced digest directly and assert its bytes are available
+        // (in the request sidecar or already in the store) so
+        // `validate_hashed_values_references` accepts the sidecar and
+        // `insert_referenced_hashed_values` installs the content once applied.
+        if op == OpType::Native {
+            let referenced = native_referenced_digests(change)?;
+            for digest in &referenced {
+                let present = change.hashed_values.contains_key(digest)
+                    || self.hash_store.contains_key(digest);
+                if !present {
+                    return Err(ServerError::Generic(format!(
+                        "missing hashed value for native op payload reference: hash {}",
+                        hex::encode(digest)
+                    )));
+                }
+            }
+            return Ok(referenced);
+        }
+
         let is_delete_only = matches!(op, OpType::Delete | OpType::RemoveUser | OpType::ListDelete);
         let mut referenced_hashes = BTreeSet::new();
 
@@ -1981,6 +2257,21 @@ impl SpaceState {
         use encrypted_spaces_storage_encoding::HASH_LEN;
 
         let mut result = HashedValues::new();
+
+        // Native ops reference their content by the payload digest rather than a
+        // hash-backed column kv. Ship those bytes in the response sidecar so
+        // broadcast / fast-forward recipients can resolve the edit; otherwise
+        // the column-scan below would return an empty sidecar for native ops.
+        if change.entry.message.op_type == OpType::Native {
+            if let Ok(referenced) = native_referenced_digests(change) {
+                for digest in referenced {
+                    if let Some(value) = self.hash_store.get(&digest) {
+                        result.insert(digest, value.clone());
+                    }
+                }
+            }
+            return result;
+        }
 
         for kv in &change.entry.message.entries {
             let (table, column) = match parse_key(&kv.key) {
@@ -2137,15 +2428,22 @@ impl SpaceState {
         //  inserts (setup/schema/access rules) happened since init.
         let num_changes = self.changelog.num_changes() as usize;
         if num_changes == self.changelog.proven_up_to {
-            self.tree_snapshot = self.db.snapshot();
+            self.tree_snapshot = self.db.checkpoint();
         }
 
         let old_root = self.get_root_hash().await;
         let applied = match self
             .do_query_with_pruned_merkle_tree(change, auth)
             .await
-            .map_err(|e| {
-                ServerError::Generic(format!("do_query_with_pruned_merkle_tree failed: {e}"))
+            .map_err(|e| match e {
+                // Preserve `StaleParent` so the transport can map it to
+                // `FastForwardRequired`; the native strict-freshness check
+                // raises it from inside `do_query`, unlike the data-driven
+                // pre-checks that run before this wrapper.
+                ServerError::StaleParent(_) => e,
+                other => ServerError::Generic(format!(
+                    "do_query_with_pruned_merkle_tree failed: {other}"
+                )),
             })? {
             Some(proof) => proof,
             None => {
@@ -2258,7 +2556,7 @@ impl SpaceState {
                     self.space_id, num_changes, e
                 ))
             })?);
-            self.tree_snapshot = Some(self.db.snapshot().ok_or_else(|| {
+            self.tree_snapshot = Some(self.db.checkpoint().ok_or_else(|| {
                 ServerError::Generic(format!(
                     "space={} missing tree snapshot after FF proof update at change {}",
                     self.space_id, num_changes
@@ -2392,6 +2690,43 @@ impl SpaceState {
             proof,
             hashed_values,
         })
+    }
+
+    /// Raw changelog read against the current DC (for `/_fs`-style raw keys).
+    /// Returns the Merk proof bytes; the client recovers and verifies the
+    /// `(key, value)` entries from the proof itself — a key read proves
+    /// inclusion, a prefix read proves the complete range.
+    pub async fn handle_raw_read(
+        &self,
+        target: &proto::raw_read_request::Target,
+        commitment: &[u8],
+    ) -> Result<Vec<u8>, SdkError> {
+        if commitment.is_empty() {
+            return Err(SdkError::ValidationError(
+                "raw read request must include a data commitment".into(),
+            ));
+        }
+        let root = self.db.root_hash();
+        if commitment != root {
+            return Err(SdkError::FastForwardRequired {
+                reason: format!(
+                    "client data commitment does not match server root \
+                     (client={}, server={})",
+                    hex::encode(commitment),
+                    hex::encode(root),
+                ),
+            });
+        }
+        let proof = match target {
+            proto::raw_read_request::Target::Key(key) => {
+                self.db.prove_keys(std::slice::from_ref(key)).await
+            }
+            proto::raw_read_request::Target::Prefix(prefix) => self.db.prove_prefix(prefix).await,
+        }
+        .map_err(|e| {
+            SdkError::DatabaseError(format!("failed to generate raw-read proof: {e:?}"))
+        })?;
+        Ok(proof)
     }
 
     ///
@@ -3033,6 +3368,7 @@ fn rows_affected(change: &ChangelogEntry) -> u64 {
         | OpType::Rekey => 1,
         OpType::ListAppend | OpType::ListInsert | OpType::ListUpdate | OpType::ListDelete => 1,
         OpType::Noop => 0,
+        OpType::Native => 1,
         OpType::Action => {
             // Same shape as Update/Delete: count unique column-key row_ids.
             // (The action-marker kv parses as a non-column key and is
@@ -3120,6 +3456,9 @@ async fn process_request_directly(
         Some(db_request::Operation::Select(select_req)) => {
             handle_select(&request.request_id, select_req, &app_cfg, &auth_context).await
         }
+        Some(db_request::Operation::RawRead(raw_read_req)) => {
+            handle_raw_read(&request.request_id, raw_read_req, &app_cfg, &auth_context).await
+        }
         Some(db_request::Operation::Change(change_req)) => {
             handle_change(&request.request_id, change_req, &app_cfg, &auth_context).await
         }
@@ -3202,6 +3541,33 @@ async fn handle_select(
                 proof: select_response.proof,
                 values_sidecar: proto::values_sidecar_to_proto(&select_response.hashed_values),
             }),
+        ),
+        Err(SdkError::FastForwardRequired { reason, .. }) => {
+            fast_forward_required_response(request_id, &reason)
+        }
+        Err(e) => error_response(request_id, &e.to_string()),
+    }
+}
+
+async fn handle_raw_read(
+    request_id: &str,
+    req: proto::RawReadRequest,
+    app_cfg: &AppConfig,
+    auth_context: &AuthContext,
+) -> DbResponse {
+    let Some(target) = req.target else {
+        return error_response(request_id, "raw_read: missing target (key or prefix)");
+    };
+    let space = get_or_create_space(auth_context.space_id, Some(app_cfg)).await;
+    let result = space
+        .lock()
+        .await
+        .handle_raw_read(&target, &req.commitment)
+        .await;
+    match result {
+        Ok(proof) => ok_response(
+            request_id,
+            db_response::Result::RawRead(proto::RawReadResponse { proof }),
         ),
         Err(SdkError::FastForwardRequired { reason, .. }) => {
             fast_forward_required_response(request_id, &reason)
@@ -4567,10 +4933,7 @@ mod tests {
         state
             .db
             .merk
-            .apply_batch(&[(
-                column_key("notes", 1, "content"),
-                merk::Op::Put(hash.to_vec()),
-            )])
+            .put(column_key("notes", 1, "content"), hash.to_vec())
             .unwrap();
 
         let root = state.get_root_hash().await;
@@ -4593,10 +4956,7 @@ mod tests {
         state
             .db
             .merk
-            .apply_batch(&[(
-                column_key("notes", 1, "content"),
-                merk::Op::Put(hash.to_vec()),
-            )])
+            .put(column_key("notes", 1, "content"), hash.to_vec())
             .unwrap();
         state.hash_store.remove(&hash);
 

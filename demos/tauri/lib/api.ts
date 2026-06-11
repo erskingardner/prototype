@@ -9,9 +9,12 @@ import type {
   CalendarItem,
   Attachment,
   InodeWithAuthor,
+  FsHandleWire,
+  TreeInodeWithAuthor,
+  TreeMoveResult,
 } from "./types";
 
-export type { InodeWithAuthor };
+export type { InodeWithAuthor, TreeInodeWithAuthor, TreeMoveResult, FsHandleWire };
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
@@ -225,6 +228,54 @@ export async function renameInode(inodeId: number, newName: string): Promise<boo
 
 export async function createFolderInode(parentId: number, name: string): Promise<unknown> {
   return invoke<unknown>("create_folder_inode", { parentId, name });
+}
+
+// ─── Tree filesystem (serialized hierarchical handles) ───────────────────────
+//
+// The tree backend addresses inodes by an FsHandleWire (string[] of hex inode
+// ids) instead of an i64 id. The root handle is []. File downloads still go
+// through the content-hash `downloadFile` path above, which is unchanged.
+
+export async function listInodesTree(
+  parent: FsHandleWire
+): Promise<TreeInodeWithAuthor[]> {
+  return invoke<TreeInodeWithAuthor[]>("list_inodes_tree", { parent });
+}
+
+export async function uploadInodesTree(
+  filePaths: string[],
+  parent: FsHandleWire
+): Promise<unknown[]> {
+  return invoke<unknown[]>("upload_inodes_tree", { filePaths, parent });
+}
+
+export async function createFolderInodeTree(
+  parent: FsHandleWire,
+  name: string
+): Promise<unknown> {
+  return invoke<unknown>("create_folder_inode_tree", { parent, name });
+}
+
+export async function deleteInodeTree(id: FsHandleWire): Promise<boolean> {
+  return invoke<boolean>("delete_inode_tree", { id });
+}
+
+export async function moveInodeTree(
+  id: FsHandleWire,
+  newParent: FsHandleWire
+): Promise<TreeMoveResult> {
+  return invoke<TreeMoveResult>("move_inode_tree", { id, newParent });
+}
+
+export async function renameInodeTree(
+  id: FsHandleWire,
+  newName: string
+): Promise<boolean> {
+  return invoke<boolean>("rename_inode_tree", { id, newName });
+}
+
+export async function downloadFileTree(id: FsHandleWire): Promise<number[]> {
+  return invoke<number[]>("download_file_tree", { id });
 }
 
 // ─── Shared Notes ──────────────────────────────────────────────────────────────

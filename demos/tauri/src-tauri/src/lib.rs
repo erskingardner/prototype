@@ -17,9 +17,19 @@ pub mod calendar;
 pub mod chat;
 pub mod commands;
 pub mod files;
+pub mod files_tree;
 pub mod notes;
 pub mod state;
 pub mod tasks;
+
+/// Reference filesystem model + invariant checker for the `files` verb tests
+/// (see `docs/native_ops_plans/PLAN_FS_TEST.md`).
+///
+/// Compiled only for this crate's own tests (`cfg(test)`) and for the
+/// `encrypted-spaces-demo-test-harness` crate via the `test-support` feature; it is
+/// absent from the production Tauri binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fs_test_model;
 
 include!(concat!(env!("OUT_DIR"), "/sdk_codegen.rs"));
 

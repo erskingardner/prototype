@@ -1,7 +1,8 @@
 //! `demo-harness` — orchestrate scripted and fuzzed scenarios for the Tauri demo.
 //!
 //! Run with:
-//!     cargo run -p encrypted-spaces-demo --features harness --bin demo-harness -- <subcommand>
+//!     cargo run -p encrypted-spaces-demo-test-harness --bin demo-harness -- <subcommand>
+//! (add `--features mrt` to run against the MRT/AVL storage backend).
 //!
 //! Subcommands:
 //!   demo                        Run the built-in Alice/Bob/Charlie scenario.

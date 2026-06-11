@@ -1,0 +1,44 @@
+// Mirrors the Tauri demo's `inodes` table (app_schema.kdl), trimmed to the
+// columns the native `rename_inode` op exercises: a plaintext `id` PK, the
+// indexed plaintext `parent_id` / `author_id`, the hash-backed (encrypted) Text
+// `name`, the plaintext `type` (the existence anchor the op probes — never a
+// written column), and the encrypted (non-plaintext, non-hash-backed) Integer
+// `mtime`. The `only_via_actions` gate + the `add_inode` / `move_inode` /
+// `rename_inode` actions are loaded so the data-driven path stays a valid
+// writer (coexistence) while raw CRUD on `inodes` stays blocked. There is no
+// `allow write` predicate; move's policy is its action assertion, and
+// `rename_inode` has no ownership or parent-folder check.
+table "inodes" {
+    column "id"        type="int"  plaintext=#true
+    column "parent_id" type="int"  plaintext=#true indexed=#true
+    column "author_id" type="int"  plaintext=#true indexed=#true
+    column "name"      type="text"
+    column "type"      type="int"  plaintext=#true
+    column "mtime"     type="int"
+
+    rules {
+        only_via_actions write "add_inode" "move_inode" "rename_inode"
+
+        // Inodes form a tree: parent_id == 0 is the root; otherwise the parent
+        // must be an existing folder (type == 2) and an inode can't be its own
+        // parent. type is 1 (file) or 2 (folder).
+        action "add_inode" {
+            assert "self.parent_id == 0 || (exists(inodes, row.id == self.parent_id && row.type == 2) && self.id != self.parent_id)"
+            assert "self.type == 1 || self.type == 2"
+            insert
+        }
+
+        // Moves an inode to a new parent. Same parent-folder invariant as
+        // `add_inode`, locked to the columns a move actually touches.
+        action "move_inode" {
+            assert "self.parent_id == 0 || (exists(inodes, row.id == self.parent_id && row.type == 2) && self.id != self.parent_id)"
+            update cols="parent_id,mtime"
+        }
+
+        // Renames an inode in place. No parent-folder invariant, since
+        // parent_id isn't touched.
+        action "rename_inode" {
+            update cols="name,mtime"
+        }
+    }
+}

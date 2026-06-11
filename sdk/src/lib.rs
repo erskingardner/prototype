@@ -9,6 +9,7 @@ mod key_manager;
 pub mod list;
 #[cfg(feature = "local-transport")]
 pub mod local_transport;
+pub mod native_op;
 pub(crate) mod retention;
 pub mod schema;
 mod state;
@@ -60,6 +61,10 @@ pub use encrypted_spaces_backend::query::Query;
 // `encrypted_spaces_backend` dependency.
 pub use encrypted_spaces_backend::SpaceId;
 pub use encrypted_spaces_changelog_core::changelog::OpType;
+/// Re-export the tree-filesystem wire codec so the demo/frontend share one
+/// source of truth with the in-guest verifier (`encrypted_spaces_sdk::tree_fs`).
+pub use encrypted_spaces_changelog_core::tree_fs;
+use encrypted_spaces_changelog_core::ReadOp;
 use encrypted_spaces_key_manager::{CollectingOperationBuilder, GkDeliveryEnvelope, KeyManager};
 // `SimpleKeyId` appears in `Space::reduce(before: SimpleKeyId)` (an
 // unconditional public retention API). Re-export so callers don't need a
@@ -206,6 +211,15 @@ impl Space {
             space_key,
         );
         let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
+        #[cfg(all(feature = "mrt", feature = "local-transport"))]
+        let dc = if let Some(local) = transport
+            .as_any()
+            .downcast_ref::<crate::local_transport::LocalTransport>()
+        {
+            local.get_root_hash().await?
+        } else {
+            dc
+        };
 
         let space_id = SpaceId::random();
         let auth_context = user.as_auth_context(space_id);
@@ -413,6 +427,46 @@ impl Space {
         self.id
     }
 
+    /// Drop the entire local query cache, forcing subsequent `select`s to
+    /// re-fetch from (and re-prove against) the committed store.
+    ///
+    /// For a normal server-backed `Space` the cache is only a query accelerator,
+    /// so clearing it does not change observable results — it just guarantees the
+    /// next read exercises the backend / KV read path rather than a warm cache.
+    /// Tests that must validate the committed-state read path (e.g. the
+    /// self-consistent filesystem suite's cold-read layer) call this on a reader
+    /// after syncing.
+    ///
+    /// Caveat: a `Space` relying on *stub* cache state with no shared server
+    /// backing (see [`Space::seed_user_cache`]) will lose that seeded state, so
+    /// for such spaces this is not result-preserving — use it only on
+    /// server-backed spaces.
+    pub fn clear_query_cache(&self) {
+        self.with_state_mut(|state| state.cache.clear_all());
+    }
+
+    /// Read a single raw changelog key at the client's current data commitment.
+    ///
+    /// The tree filesystem (Phase B) stores its `NodeRecord`s under raw `/_fs`
+    /// keys rather than table columns, so it reads them through this op instead
+    /// of `select`.
+    pub async fn raw_read_key(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let commitment = self.current_data_commitment();
+        let mut entries = self
+            .transport
+            .raw_read(ReadOp::Key(key), &commitment)
+            .await?;
+        Ok(entries.pop().map(|(_, value)| value))
+    }
+
+    /// Prefix-scan raw changelog keys at the client's current data commitment.
+    pub async fn raw_read_prefix(&self, prefix: Vec<u8>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let commitment = self.current_data_commitment();
+        self.transport
+            .raw_read(ReadOp::Prefix(prefix), &commitment)
+            .await
+    }
+
     /// Return a typed handle to a SQL table named `name`.
     ///
     /// This does **not** create the underlying table. You must initialize the table
@@ -516,7 +570,6 @@ mod tests {
     use encrypted_spaces_changelog_core::changelog::{initial_clc_state, Change, FastForwardData};
     use encrypted_spaces_ffproof::EXTEND_FF_ID;
     use encrypted_spaces_key_manager::DefaultSignature;
-    use expect_test::expect;
     use serde::{Deserialize, Serialize};
     use std::sync::Once;
 
@@ -537,20 +590,26 @@ mod tests {
         ApplicationSchema::for_testing(vec![], crate::testing::initial_internal_data_commitment())
     }
 
-    /// Guards the hardcoded fresh-space root used by `Space::new()`.
+    /// Guards the hardcoded fresh-space root used by `Space::new()`, for the
+    /// active backend.
     ///
-    /// Changes to the internal schema can legitimately change that root.
-    /// `expect!` makes those changes easy to spot because the failure shows the new hex value.
-    /// If the change is intentional, run the test with `UPDATE_EXPECT=1` and then copy the same
-    /// value into `INITIAL_INTERNAL_DATA_COMMITMENT_HEX` in `testing.rs`.
+    /// `initial_internal_data_commitment()` returns the backend-specific
+    /// `INITIAL_INTERNAL_DATA_COMMITMENT_HEX` (AVL / MRT) — the single source of
+    /// truth — so this one assertion covers both backends. Changes to the
+    /// internal schema can legitimately shift the root; on failure the message
+    /// prints the new value to copy into the matching cfg branch of the const in
+    /// `testing.rs`.
     #[tokio::test]
     async fn initial_internal_data_commitment_matches_fresh_transport_root() -> Result<()> {
         let transport = LocalTransport::in_memory().await?;
         let actual = transport.get_root_hash().await?;
-        let actual_hex = hex::encode(actual);
-        expect!["ee8d222228e87c4e768cca7f601b9f2f2af1ee4fa3594af0592d2b022d5aa103"]
-            .assert_eq(&actual_hex);
-        assert_eq!(crate::testing::initial_internal_data_commitment(), actual);
+        assert_eq!(
+            crate::testing::initial_internal_data_commitment(),
+            actual,
+            "fresh-space internal-schema root drifted; update \
+             INITIAL_INTERNAL_DATA_COMMITMENT_HEX (active backend) in testing.rs to {}",
+            hex::encode(actual),
+        );
         Ok(())
     }
 

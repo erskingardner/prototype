@@ -8,6 +8,13 @@ edition.workspace = true
 [features]
 default = []
 merk = ["encrypted-spaces-backend/merk"]
+mrt = [
+    "merk",
+    "encrypted-spaces-backend/mrt",
+    "encrypted-spaces-backend-server?/mrt",
+    "encrypted-spaces-changelog-core/mrt",
+    "encrypted-spaces-ffproof/mrt",
+]
 local-transport = ["merk", "dep:encrypted-spaces-backend-server"]
 # Activates the prover-side surface of `encrypted-spaces-ffproof` (and thus
 # the RISC-V guest binary build) and unlocks the in-crate `testing`

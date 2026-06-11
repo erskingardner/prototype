@@ -98,7 +98,7 @@ impl Space {
     pub(crate) async fn apply_broadcast_cache_updates(
         &self,
         change: &encrypted_spaces_changelog_core::changelog::Change,
-        writes: &[encrypted_spaces_changelog_core::BatchOp],
+        writes: &[encrypted_spaces_changelog_core::WriteOp],
     ) {
         // Reduce prunes old retention keys — data encrypted with those
         // keys can no longer be decrypted, so just purge all cached

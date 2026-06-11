@@ -1,12 +1,18 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
-import { open, save, confirm } from "@tauri-apps/plugin-dialog";
+import { useEffect, useState, useCallback, useMemo, useRef, type DragEvent } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
-import { useSpace, useSpaceDispatch } from "@/lib/store";
 import * as api from "@/lib/api";
-import { INODE_FILE, INODE_FOLDER, ROOT_PARENT, type InodeWithAuthor } from "@/lib/types";
+import {
+  INODE_FOLDER,
+  INODE_FILE,
+  ROOT_HANDLE,
+  handleKey,
+  type FsHandleWire,
+  type TreeInodeWithAuthor,
+} from "@/lib/types";
 import { FileTypeIcon, formatSize } from "./message-input";
 
 const IMAGE_MIMES = new Set([
@@ -17,6 +23,26 @@ const VIDEO_MIMES = new Set(["video/mp4", "video/webm", "video/ogg", "video/quic
 
 function getExt(name: string): string {
   return name.split(".").pop()?.toLowerCase() ?? "";
+}
+
+/** True if `prefix` is a (non-strict) prefix of `handle` — i.e. `handle` is at
+ *  or inside the subtree rooted at `prefix`. */
+function isHandlePrefix(prefix: FsHandleWire, handle: FsHandleWire): boolean {
+  return prefix.length <= handle.length && prefix.every((label, i) => label === handle[i]);
+}
+
+/** Rebase `target` from the moved subtree `oldRoot` onto `newRoot`. Returns
+ *  `target` unchanged when it does not point inside the moved subtree. A move
+ *  rebases the moved root's handle and every descendant handle (the handle is
+ *  the hierarchical position), so any handle the UI still holds must be rebased.
+ */
+function rebaseHandle(
+  target: FsHandleWire,
+  oldRoot: FsHandleWire,
+  newRoot: FsHandleWire,
+): FsHandleWire {
+  if (!isHandlePrefix(oldRoot, target)) return target;
+  return [...newRoot, ...target.slice(oldRoot.length)];
 }
 
 function formatDate(ts: number): string {
@@ -30,34 +56,56 @@ function formatDate(ts: number): string {
 }
 
 export default function Files() {
-  const { inodes } = useSpace();
-  const dispatch = useSpaceDispatch();
+  // The tree browser keeps its own listing in local state (the shared store's
+  // `inodes` is typed for the table backend). Refreshed by every mutating action.
+  const [inodes, setInodes] = useState<TreeInodeWithAuthor[]>([]);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // In-app confirmation (no Tauri dialog plugin — works in any webview without a
+  // permission/ACL rebuild). `askConfirm` resolves when the user clicks a button.
+  const [confirmDialog, setConfirmDialog] = useState<
+    { message: string; title: string; resolve: (ok: boolean) => void } | null
+  >(null);
+  function askConfirm(message: string, title: string): Promise<boolean> {
+    return new Promise((resolve) => setConfirmDialog({ message, title, resolve }));
+  }
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
-  const [renamingId, setRenamingId] = useState<number | null>(null);
+  // Rename target keyed by handle string (handles are arrays, not stable refs).
+  const [renamingKey, setRenamingKey] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  // Navigation stack: array of { id, name } representing the folder path
-  const [pathStack, setPathStack] = useState<{ id: number; name: string }[]>([
-    { id: ROOT_PARENT, name: "Files" },
+  // Navigation stack: folder path of { handle, name }. The tree backend's inode
+  // identity is a hierarchical handle (FsHandleWire), with the root as [].
+  const [pathStack, setPathStack] = useState<{ id: FsHandleWire; name: string }[]>([
+    { id: ROOT_HANDLE, name: "Files" },
   ]);
   // File cache for lightbox blob URLs
   const [fileCache, setFileCache] = useState<Record<string, string>>({});
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [savingHash, setSavingHash] = useState<string | null>(null);
+  // Drag-and-drop move state. `draggedRef` holds the node being dragged;
+  // `dropTargetKey` highlights the folder/breadcrumb under the cursor.
+  const draggedRef = useRef<TreeInodeWithAuthor | null>(null);
+  const [draggingKey, setDraggingKey] = useState<string | null>(null);
+  const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
 
-  const currentParentId = pathStack[pathStack.length - 1].id;
+  const currentParent = pathStack[pathStack.length - 1].id;
 
   // Load inodes for current directory
   const refresh = useCallback(async () => {
     try {
-      const items = await api.listInodes(currentParentId);
-      dispatch({ type: "setInodes", inodes: items });
-    } catch {
-      // ignore — will show stale data
+      const items = await api.listInodesTree(currentParent);
+      setInodes(items);
+      setError(null);
+    } catch (e: any) {
+      // Surface (don't swallow): a failing proven read here means the client's
+      // data commitment diverged from the server — which otherwise just looks
+      // like "the write didn't take" (a stale listing).
+      setError(`Listing failed: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
-  }, [currentParentId, dispatch]);
+    // currentParent is an array; key the effect on its stable string form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handleKey(currentParent)]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -90,7 +138,7 @@ export default function Files() {
     } catch { /* ignore */ }
   }, [fileCache]);
 
-  function navigateToFolder(folderId: number, folderName: string) {
+  function navigateToFolder(folderId: FsHandleWire, folderName: string) {
     setPathStack((prev) => [...prev, { id: folderId, name: folderName }]);
   }
 
@@ -107,7 +155,7 @@ export default function Files() {
     setUploading(true);
     setError(null);
     try {
-      await api.uploadInodes(paths, currentParentId);
+      await api.uploadInodesTree(paths, currentParent);
       await refresh();
     } catch (e: any) {
       setError(typeof e === "string" ? e : e?.message ?? "Upload failed");
@@ -131,20 +179,21 @@ export default function Files() {
     }
   }
 
-  async function handleDelete(inodeId: number, name: string, isFolder: boolean) {
+  async function handleDelete(id: FsHandleWire, name: string, isFolder: boolean) {
     const msg = isFolder
       ? `Delete folder "${name}" and all its contents? This cannot be undone.`
       : `Delete "${name}"? This cannot be undone.`;
     try {
-      const ok = await confirm(msg, {
-        title: isFolder ? "Delete folder" : "Delete file",
-        kind: "warning",
-      });
+      const ok = await askConfirm(msg, isFolder ? "Delete folder" : "Delete file");
       if (!ok) return;
-      await api.deleteInode(inodeId);
+      const deleted = await api.deleteInodeTree(id);
+      if (!deleted) {
+        // rows_affected == 0: the server's verifier read the target as absent.
+        setError(`Delete had no effect: "${name}" was not found on the server.`);
+      }
       await refresh();
     } catch (e: any) {
-      setError(typeof e === "string" ? e : e?.message ?? "Delete failed");
+      setError(`Delete failed: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
     }
   }
 
@@ -154,29 +203,97 @@ export default function Files() {
     setCreatingFolder(false);
     setNewFolderName("");
     try {
-      await api.createFolderInode(currentParentId, name);
+      await api.createFolderInodeTree(currentParent, name);
       await refresh();
     } catch (e: any) {
       setError(typeof e === "string" ? e : e?.message ?? "Create folder failed");
     }
   }
 
-  async function handleRename(inodeId: number) {
+  async function handleRename(id: FsHandleWire) {
     const name = renameValue.trim();
     if (!name) return;
     try {
-      await api.renameInode(inodeId, name);
+      await api.renameInodeTree(id, name);
       await refresh();
     } catch (e: any) {
       setError(typeof e === "string" ? e : e?.message ?? "Rename failed");
     } finally {
-      setRenamingId(null);
+      setRenamingKey(null);
       setRenameValue("");
     }
   }
 
-  function openPreview(file: InodeWithAuthor) {
-    const idx = previewableFiles.findIndex((f) => f.id === file.id);
+  // Move `node` into the directory at handle `dest` (drag-and-drop). A move
+  // rebases the moved root's handle and every descendant handle, so we consume
+  // MoveInodeResult.new_id to rebase any visible handle (the breadcrumb path)
+  // before refreshing; stale pre-move handles are dropped.
+  async function handleMove(node: TreeInodeWithAuthor, dest: FsHandleWire) {
+    const nodeK = handleKey(node.id);
+    // No-ops: drop onto itself, into the current parent, or into own subtree.
+    if (nodeK === handleKey(dest)) return;
+    if (handleKey(node.parent_id) === handleKey(dest)) return;
+    if (isHandlePrefix(node.id, dest)) return;
+    setError(null);
+    try {
+      const result = await api.moveInodeTree(node.id, dest);
+      if (result.moved && result.new_id) {
+        const newId = result.new_id;
+        setPathStack((prev) =>
+          prev.map((bc) => ({ ...bc, id: rebaseHandle(bc.id, node.id, newId) })),
+        );
+        if (renamingKey === nodeK) setRenamingKey(null);
+      }
+      await refresh();
+    } catch (e: any) {
+      setError(`Move failed: ${typeof e === "string" ? e : (e?.message ?? String(e))}`);
+    }
+  }
+
+  // ─── Drag-and-drop handlers ─────────────────────────────────────────────
+  function onRowDragStart(node: TreeInodeWithAuthor) {
+    draggedRef.current = node;
+    setDraggingKey(handleKey(node.id));
+  }
+
+  function onRowDragEnd() {
+    draggedRef.current = null;
+    setDraggingKey(null);
+    setDropTargetKey(null);
+  }
+
+  // A folder/breadcrumb at handle `dest` accepts the drop unless it is the
+  // dragged node itself, its current parent, or inside its own subtree.
+  function canDropOn(dest: FsHandleWire): boolean {
+    const node = draggedRef.current;
+    if (!node) return false;
+    if (handleKey(node.id) === handleKey(dest)) return false;
+    if (handleKey(node.parent_id) === handleKey(dest)) return false;
+    return !isHandlePrefix(node.id, dest);
+  }
+
+  function onDropTargetOver(e: DragEvent, dest: FsHandleWire, key: string) {
+    if (!canDropOn(dest)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (dropTargetKey !== key) setDropTargetKey(key);
+  }
+
+  function onDropTargetLeave(key: string) {
+    if (dropTargetKey === key) setDropTargetKey(null);
+  }
+
+  function onDropTarget(e: DragEvent, dest: FsHandleWire) {
+    e.preventDefault();
+    const node = draggedRef.current;
+    setDropTargetKey(null);
+    setDraggingKey(null);
+    draggedRef.current = null;
+    if (node) handleMove(node, dest);
+  }
+
+  function openPreview(file: TreeInodeWithAuthor) {
+    const idx = previewableFiles.findIndex((f) => handleKey(f.id) === handleKey(file.id));
     if (idx >= 0) {
       setLightboxIndex(idx);
     }
@@ -192,18 +309,28 @@ export default function Files() {
     <div className="files-container">
       <div className="files-header">
         <div className="files-breadcrumbs">
-          {breadcrumbs.map((bc, i) => (
-            <span key={bc.id + ":" + i}>
-              {i > 0 && <span className="files-bc-sep">/</span>}
-              {i < breadcrumbs.length - 1 ? (
-                <button className="files-bc-btn" onClick={() => navigateToBreadcrumb(i)}>
-                  {bc.name}
-                </button>
-              ) : (
-                <span className="files-bc-current">{bc.name}</span>
-              )}
-            </span>
-          ))}
+          {breadcrumbs.map((bc, i) => {
+            const bcKey = "bc:" + handleKey(bc.id) + ":" + i;
+            const isDropTarget = dropTargetKey === bcKey;
+            return (
+              <span key={bcKey}>
+                {i > 0 && <span className="files-bc-sep">/</span>}
+                {i < breadcrumbs.length - 1 ? (
+                  <button
+                    className={`files-bc-btn ${isDropTarget ? "files-drop-target" : ""}`}
+                    onClick={() => navigateToBreadcrumb(i)}
+                    onDragOver={(e) => onDropTargetOver(e, bc.id, bcKey)}
+                    onDragLeave={() => onDropTargetLeave(bcKey)}
+                    onDrop={(e) => onDropTarget(e, bc.id)}
+                  >
+                    {bc.name}
+                  </button>
+                ) : (
+                  <span className="files-bc-current">{bc.name}</span>
+                )}
+              </span>
+            );
+          })}
         </div>
         <div className="files-header-actions">
           <button
@@ -244,6 +371,39 @@ export default function Files() {
         </div>
       )}
 
+      {confirmDialog && (
+        <div
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
+            display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+          }}
+          onClick={() => { confirmDialog.resolve(false); setConfirmDialog(null); }}
+        >
+          <div
+            style={{
+              background: "var(--background, #1e1e1e)", color: "var(--foreground, #eee)",
+              padding: "1.25rem 1.5rem", borderRadius: 8, maxWidth: "26rem",
+              boxShadow: "0 10px 40px rgba(0,0,0,0.4)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: "0 0 0.5rem" }}>{confirmDialog.title}</h3>
+            <p style={{ margin: "0 0 1.25rem" }}>{confirmDialog.message}</p>
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+              <button onClick={() => { confirmDialog.resolve(false); setConfirmDialog(null); }}>
+                Cancel
+              </button>
+              <button
+                style={{ background: "#dc2626", color: "#fff", border: "none", padding: "0.4rem 0.9rem", borderRadius: 4 }}
+                onClick={() => { confirmDialog.resolve(true); setConfirmDialog(null); }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isEmpty ? (
         <div className="files-empty">
           <p>No files here yet.</p>
@@ -252,29 +412,41 @@ export default function Files() {
       ) : (
         <div className="files-list">
           {/* Folders first */}
-          {folders.map((node) => (
+          {folders.map((node) => {
+            const nodeK = handleKey(node.id);
+            const rowClass =
+              "files-row files-folder-row" +
+              (draggingKey === nodeK ? " files-row-dragging" : "") +
+              (dropTargetKey === nodeK ? " files-drop-target" : "");
+            return (
             <div
-              key={node.id}
-              className="files-row files-folder-row"
+              key={nodeK}
+              className={rowClass}
+              draggable
+              onDragStart={() => onRowDragStart(node)}
+              onDragEnd={onRowDragEnd}
+              onDragOver={(e) => onDropTargetOver(e, node.id, nodeK)}
+              onDragLeave={() => onDropTargetLeave(nodeK)}
+              onDrop={(e) => onDropTarget(e, node.id)}
             >
               <span
                 className="files-icon files-folder-icon"
-                onClick={() => node.id !== null && navigateToFolder(node.id, node.name)}
+                onClick={() => navigateToFolder(node.id, node.name)}
               >
                 <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M1 3v10h14V5H7.5L6 3H1zm1 1h3.3l1.5 2H14v6H2V4z"/></svg>
               </span>
-              <div className="files-info" onClick={() => node.id !== null && navigateToFolder(node.id, node.name)}>
-                {renamingId === node.id ? (
+              <div className="files-info" onClick={() => navigateToFolder(node.id, node.name)}>
+                {renamingKey === nodeK ? (
                   <input
                     className="files-rename-input"
                     autoFocus
                     value={renameValue}
                     onChange={(e) => setRenameValue(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && node.id !== null) handleRename(node.id);
-                      if (e.key === "Escape") { setRenamingId(null); setRenameValue(""); }
+                      if (e.key === "Enter") handleRename(node.id);
+                      if (e.key === "Escape") { setRenamingKey(null); setRenameValue(""); }
                     }}
-                    onBlur={() => { setRenamingId(null); setRenameValue(""); }}
+                    onBlur={() => { setRenamingKey(null); setRenameValue(""); }}
                     onClick={(e) => e.stopPropagation()}
                   />
                 ) : (
@@ -288,23 +460,25 @@ export default function Files() {
                 <button
                   className="files-action-btn"
                   title="Rename"
-                  onClick={(e) => { e.stopPropagation(); setRenamingId(node.id); setRenameValue(node.name); }}
+                  onClick={(e) => { e.stopPropagation(); setRenamingKey(nodeK); setRenameValue(node.name); }}
                 >
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M12.1 1.3a1 1 0 0 1 1.4 0l1.2 1.2a1 1 0 0 1 0 1.4l-8.5 8.5L3 13l.6-3.2 8.5-8.5zM11.4 4L5 10.4l-.3 1.6 1.6-.3L12.7 5.3 11.4 4z"/></svg>
                 </button>
                 <button
                   className="files-action-btn files-delete-btn"
                   title="Delete folder"
-                  onClick={(e) => { e.stopPropagation(); node.id !== null && handleDelete(node.id, node.name, true); }}
+                  onClick={(e) => { e.stopPropagation(); handleDelete(node.id, node.name, true); }}
                 >
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 2V1h6v1h4v1H1V2h4zm0 2h6l-.5 10h-5L5 4zm2 1.5v7h2v-7H7z"/></svg>
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
 
           {/* Files */}
           {files.map((node) => {
+            const nodeK = handleKey(node.id);
             const canPreview = isPreviewable(node.mime_type);
             const isImage = IMAGE_MIMES.has(node.mime_type);
             const thumbUrl = isImage ? fileCache[node.file_hash] : null;
@@ -315,7 +489,13 @@ export default function Files() {
             }
 
             return (
-              <div key={node.id} className="files-row">
+              <div
+                key={nodeK}
+                className={`files-row${draggingKey === nodeK ? " files-row-dragging" : ""}`}
+                draggable
+                onDragStart={() => onRowDragStart(node)}
+                onDragEnd={onRowDragEnd}
+              >
                 <span
                   className={`files-icon ${canPreview ? "files-icon-clickable" : ""}`}
                   onClick={() => canPreview && openPreview(node)}
@@ -328,17 +508,17 @@ export default function Files() {
                   )}
                 </span>
                 <div className="files-info">
-                  {renamingId === node.id ? (
+                  {renamingKey === nodeK ? (
                     <input
                       className="files-rename-input"
                       autoFocus
                       value={renameValue}
                       onChange={(e) => setRenameValue(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === "Enter" && node.id !== null) handleRename(node.id);
-                        if (e.key === "Escape") { setRenamingId(null); setRenameValue(""); }
+                        if (e.key === "Enter") handleRename(node.id);
+                        if (e.key === "Escape") { setRenamingKey(null); setRenameValue(""); }
                       }}
-                      onBlur={() => { setRenamingId(null); setRenameValue(""); }}
+                      onBlur={() => { setRenamingKey(null); setRenameValue(""); }}
                     />
                   ) : (
                     <span
@@ -356,7 +536,7 @@ export default function Files() {
                   <button
                     className="files-action-btn"
                     title="Rename"
-                    onClick={() => { setRenamingId(node.id); setRenameValue(node.name); }}
+                    onClick={() => { setRenamingKey(nodeK); setRenameValue(node.name); }}
                   >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M12.1 1.3a1 1 0 0 1 1.4 0l1.2 1.2a1 1 0 0 1 0 1.4l-8.5 8.5L3 13l.6-3.2 8.5-8.5zM11.4 4L5 10.4l-.3 1.6 1.6-.3L12.7 5.3 11.4 4z"/></svg>
                   </button>
@@ -384,7 +564,7 @@ export default function Files() {
                   <button
                     className="files-action-btn files-delete-btn"
                     title="Delete"
-                    onClick={() => node.id !== null && handleDelete(node.id, node.name, false)}
+                    onClick={() => handleDelete(node.id, node.name, false)}
                   >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 2V1h6v1h4v1H1V2h4zm0 2h6l-.5 10h-5L5 4zm2 1.5v7h2v-7H7z"/></svg>
                   </button>
@@ -414,11 +594,11 @@ export default function Files() {
 // ─── File Lightbox ──────────────────────────────────────────────────────────
 
 function FileLightbox({ files, startIndex, fileCache, onClose, onSave, savingHash, ensureFileLoaded }: {
-  files: InodeWithAuthor[];
+  files: TreeInodeWithAuthor[];
   startIndex: number;
   fileCache: Record<string, string>;
   onClose: () => void;
-  onSave: (f: InodeWithAuthor) => void;
+  onSave: (f: TreeInodeWithAuthor) => void;
   savingHash: string | null;
   ensureFileLoaded: (hash: string, mime: string) => void;
 }) {
@@ -529,7 +709,7 @@ function FileLightbox({ files, startIndex, fileCache, onClose, onSave, savingHas
           <div className="lightbox-strip">
             {files.map((f, i) => (
               <button
-                key={f.id}
+                key={handleKey(f.id)}
                 className={`lightbox-thumb ${i === index ? "lightbox-thumb-active" : ""}`}
                 onClick={() => setIndex(i)}
               >

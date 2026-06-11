@@ -16,5 +16,12 @@ merk = { workspace = true }
 postcard = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+mrt = [
+    "encrypted-spaces-backend/mrt",
+    "encrypted-spaces-backend-server/mrt",
+    "encrypted-spaces-changelog-core/mrt",
+]
+
 [lib]
 path = "src/test_server.rs"

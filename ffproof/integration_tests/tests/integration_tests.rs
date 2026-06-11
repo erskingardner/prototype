@@ -802,7 +802,7 @@ impl AclServer {
         state.changelog = ChangeLog::new(&root);
 
         // Refresh tree snapshot after ACL blob was re-written
-        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot = state.db.checkpoint();
 
         let initial_dc = state.get_root_hash().await;
 
@@ -1006,26 +1006,6 @@ async fn test_per_change_verifier_authenticates_acl_blob() {
 
 async fn test_per_change_verifier_authenticates_acl_blob_inner() {
     use encrypted_spaces_changelog_core::changelog::ChangeLog;
-    use encrypted_spaces_changelog_core::{acl_rule_key, PrunedMerkleTree};
-
-    fn tamper_acl_blob_value(node: &mut PrunedMerkleTree, acl_key: &[u8]) -> bool {
-        match node {
-            PrunedMerkleTree::Empty | PrunedMerkleTree::Pruned { .. } => false,
-            PrunedMerkleTree::Full {
-                key,
-                value,
-                left,
-                right,
-            } => {
-                if key.as_slice() == acl_key {
-                    value.push(0);
-                    true
-                } else {
-                    tamper_acl_blob_value(left, acl_key) || tamper_acl_blob_value(right, acl_key)
-                }
-            }
-        }
-    }
 
     let server = AclServer::new().await;
 
@@ -1077,17 +1057,15 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
     )
     .expect("authorized insert proof should verify");
 
-    // Sanity-check that the pruned tree witness contains the ACL rule as a full
-    // node, then prove that mutating it breaks the old-root commitment.
-    let mut tampered_pruned: PrunedMerkleTree =
-        postcard::from_bytes(&response.pruned_merkle_tree).expect("proof deserializes");
-    let acl_key = acl_rule_key("products", "write");
-    assert!(
-        tamper_acl_blob_value(&mut tampered_pruned, &acl_key),
-        "pruned tree witness should contain the ACL rule key"
-    );
-    let tampered_bytes =
-        postcard::to_allocvec(&tampered_pruned).expect("serialize tampered pruned tree proof");
+    // The witness is merk's opaque trace bytes, authenticated against
+    // `old_root` by `TraceReplayer::new_verified` (issue #16: the ACL rule blob
+    // the verifier reads is part of that authenticated trace). Corrupting the
+    // trace breaks the start-root commitment, so the verifier must reject it.
+    let mut tampered_bytes = response.pruned_merkle_tree.clone();
+    assert!(!tampered_bytes.is_empty(), "witness must be non-empty");
+    for b in tampered_bytes.iter_mut() {
+        *b ^= 0xFF;
+    }
     let err = ChangeLog::verify_proof_and_validate(
         &change.entry,
         &tampered_bytes,
@@ -1095,14 +1073,13 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
         &response.new_root,
         current_change_id,
     )
-    .expect_err("proof with tampered ACL rule must be rejected");
-    let msg = err.to_string();
+    .expect_err("a tampered trace witness must be rejected");
     assert!(
-        msg.contains("start root mismatch") || msg.contains("ACL rule"),
-        "unexpected error for tampered ACL rule: {msg}"
+        err.to_string().contains("verify_proof"),
+        "unexpected error for tampered witness: {err}"
     );
 
-    let garbage_bytes = b"not a pruned merkle tree".to_vec();
+    let garbage_bytes = b"not a merk trace witness".to_vec();
     let err = ChangeLog::verify_proof_and_validate(
         &change.entry,
         &garbage_bytes,
@@ -1110,11 +1087,10 @@ async fn test_per_change_verifier_authenticates_acl_blob_inner() {
         &response.new_root,
         current_change_id,
     )
-    .expect_err("garbage pruned tree proof must be rejected");
-    let msg = err.to_string();
+    .expect_err("a garbage trace witness must be rejected");
     assert!(
-        msg.contains("pruned tree proof deserialize failed"),
-        "unexpected error for garbage pruned tree proof: {msg}"
+        err.to_string().contains("verify_proof"),
+        "unexpected error for garbage witness: {err}"
     );
 }
 
@@ -1133,7 +1109,6 @@ async fn test_proof_contains_reads() {
 
 async fn test_proof_contains_reads_inner() {
     use encrypted_spaces_changelog_core::changelog::ChangeLog;
-    use encrypted_spaces_changelog_core::PrunedMerkleTree;
 
     println!("=== Proof Contains Reads Test ===");
     let server = Server::new().await;
@@ -1171,34 +1146,16 @@ async fn test_proof_contains_reads_inner() {
 
     let response = server.handle_change(&change, &auth1).await.unwrap();
 
-    // Deserialize the pruned merkle tree and verify it contains data
-    let pruned_node: PrunedMerkleTree =
-        postcard::from_bytes(&response.pruned_merkle_tree).expect("pruned tree deserializes");
-    let node_count = match &pruned_node {
-        PrunedMerkleTree::Empty => 0usize,
-        _ => {
-            fn count_nodes(node: &PrunedMerkleTree) -> usize {
-                match node {
-                    PrunedMerkleTree::Empty => 0,
-                    PrunedMerkleTree::Pruned { .. } => 1,
-                    PrunedMerkleTree::Full { left, right, .. } => {
-                        1 + count_nodes(left) + count_nodes(right)
-                    }
-                }
-            }
-            count_nodes(&pruned_node)
-        }
-    };
-
-    println!(
-        "Pruned tree: {} nodes, proof size: {} bytes",
-        node_count,
-        response.pruned_merkle_tree.len()
-    );
+    // The witness is merk's opaque trace bytes — we can't introspect node
+    // counts, but a successful `verify_proof_and_validate` *replays the op
+    // against the trace*, which only works if the op's reads (user existence,
+    // schema columns, ...) were embedded in the witness. So a passing verify is
+    // itself the proof that reads are present; sanity-check it is non-empty.
     assert!(
-        node_count > 0,
-        "Pruned merkle tree should contain nodes (reads embed user, schema, ACL data)"
+        !response.pruned_merkle_tree.is_empty(),
+        "per-change witness should be non-empty (embeds user/schema reads + writes)"
     );
+    println!("Witness size: {} bytes", response.pruned_merkle_tree.len());
 
     // Verify the proof validates via the changelog verifier
     let writes = ChangeLog::verify_proof_and_validate(
@@ -1208,13 +1165,9 @@ async fn test_proof_contains_reads_inner() {
         &response.new_root,
         1,
     )
-    .expect("pruned tree proof should validate");
+    .expect("trace witness proof should validate");
     assert!(!writes.is_empty(), "Proof should produce write operations");
-    println!(
-        "✓ Pruned tree validates: {} write ops, {} nodes",
-        writes.len(),
-        node_count
-    );
+    println!("✓ Trace witness validates: {} write ops", writes.len());
 
     // Also verify through the SDK path
     client1
@@ -1228,9 +1181,10 @@ async fn test_proof_contains_reads_inner() {
 // ─── Read-your-own-writes test ─────────────────────────────────────────────
 
 /// Test that a batch containing CreateSpaceOp followed by an InsertOp by the
-/// newly-created user can be proven.  Currently `extract_input_steps` resolves
-/// every op's reads against the pre-batch tree snapshot, so the InsertOp's
-/// `validate_user_access` cannot see the user that CreateSpaceOp just wrote.
+/// newly-created user can be proven.  The recorder seam applies each change's
+/// writes to the trace handle before the next change runs, so the InsertOp's
+/// `validate_user_access` reads the user that CreateSpaceOp just wrote
+/// (read-your-own-writes within the batch).
 #[tokio::test]
 async fn test_create_space_then_insert_same_batch() {
     if std::env::var("RISC0_SKIP_BUILD").is_ok() {
@@ -1394,10 +1348,10 @@ async fn test_create_space_then_insert_same_batch_inner() {
 
     // ── Verify proof generation ─────────────────────────────────────────
     // With batch_size=2, maybe_generate_ff_proof should have run after
-    // change #2.  It calls extract_input_steps which currently reads ALL
-    // ops against the pre-batch tree snapshot.  The InsertOp's
-    // validate_user_access reads the _users table from that snapshot where
-    // user 1 does not yet exist → proof generation fails.
+    // change #2.  It builds the trace via the recorder seam, which applies
+    // CreateSpaceOp's writes before the InsertOp runs, so the InsertOp's
+    // validate_user_access sees the just-created user and proof generation
+    // succeeds.
     assert_eq!(
         state.changelog.num_changes(),
         2,
@@ -1405,9 +1359,9 @@ async fn test_create_space_then_insert_same_batch_inner() {
     );
     assert_eq!(
         state.changelog.proven_up_to, batch_size,
-        "FF proof should cover both changes (proven_up_to should be {batch_size}), \
-         but extract_input_steps currently fails because the InsertOp cannot read \
-         the user created by CreateSpaceOp in the same batch"
+        "FF proof should cover both changes (proven_up_to should be {batch_size}): \
+         the recorder seam lets the InsertOp read the user CreateSpaceOp wrote \
+         in the same batch"
     );
 
     println!("=== Create-Space-then-Insert Same-Batch Test passed! ===");
@@ -1533,4 +1487,164 @@ async fn test_zkvm_hash_correctness() {
         "=== zkvm_hash_tests passed in {} user cycles ===",
         proof_info.stats.user_cycles
     );
+}
+
+// ─── Stage 6: real recorder→finalize→replayer seam coverage ──────────────────
+//
+// The op unit tests drive each op against hand-built `VerifierReader` reads and
+// never exercise the real `TraceReplayer`. These two tests submit a change
+// through `handle_change` (via the in-process `LocalTransport` server), whose
+// per-change write path records the op against a real `TraceRecorder`,
+// `finalize_trace`s it, and replays it with `TraceReplayer::new_verified`
+// (in `apply_change_with_pruned_tree` + `ChangeLog::add_change`). A
+// recorder/replayer disagreement would surface here as a failed submit. The
+// large FF batch size keeps these on the pure-host per-change seam (no zkVM
+// proof is triggered), so they run regardless of guest build state.
+
+/// Explicit-id insert (a non-auto-increment table where the client supplies the
+/// row id) driven end-to-end through the real recorder→finalize→replayer path.
+/// The insert op resolves the explicit id and reads it back through the traced
+/// handle; the unit tests only check that logic against hand-built reads.
+#[tokio::test]
+async fn test_explicit_id_insert_through_proven_path() {
+    use encrypted_spaces_sdk::schema::{ColumnType, SchemaBuilder};
+
+    let space = Space::new(LocalTransport::in_memory().await.unwrap())
+        .await
+        .unwrap();
+
+    // `explicit_ids()` disables auto-increment: every insert must carry its own
+    // `id`.
+    let schema = SchemaBuilder::new("manual")
+        .explicit_ids()
+        .column("id", ColumnType::Integer)
+        .plaintext_primary_key()
+        .column("data", ColumnType::String)
+        .unwrap()
+        .plaintext()
+        .build()
+        .unwrap();
+
+    let table = space.table::<serde_json::Value>("manual");
+    space.create_table(&schema).await.unwrap();
+
+    let explicit_id: i64 = 4242;
+    let assigned = table
+        .insert(&serde_json::json!({"id": explicit_id, "data": "explicit"}))
+        .execute()
+        .await
+        .expect("explicit-id insert must be accepted through the proven path");
+    assert_eq!(
+        assigned, explicit_id,
+        "explicit-id insert must keep the client-supplied id"
+    );
+
+    // Read it back through the verified SELECT path to confirm it landed in the
+    // proven tree.
+    let rows = table
+        .select()
+        .where_eq("id", explicit_id)
+        .all()
+        .await
+        .expect("select on the explicit-id row must verify");
+    assert_eq!(
+        rows.len(),
+        1,
+        "explicit-id row must be present after insert"
+    );
+    assert_eq!(rows[0]["data"], serde_json::json!("explicit"));
+}
+
+/// A schema-declared action whose `exists()` assertion reads a *different* table
+/// than its insert leg — the cross-leg read — driven end-to-end through the
+/// real recorder→finalize→replayer path. The action op's cross-leg reads are
+/// only unit-tested against hand-built `VerifierReader` reads.
+#[tokio::test]
+async fn test_action_cross_leg_through_proven_path() {
+    use encrypted_spaces_acl_types::{
+        AccessRule, Action, ActionLeg, Assertion, ColumnNamespace, ComparisonOp, RuleValue,
+    };
+    use encrypted_spaces_sdk::schema::{ApplicationSchema, ColumnType, SchemaBuilder};
+    use std::collections::BTreeMap;
+
+    let parents = SchemaBuilder::new("parents")
+        .column("id", ColumnType::Integer)
+        .plaintext_primary_key()
+        .column("name", ColumnType::Text)
+        .unwrap()
+        .build()
+        .unwrap();
+    let children = SchemaBuilder::new("children")
+        .column("id", ColumnType::Integer)
+        .plaintext_primary_key()
+        .column("parent_id", ColumnType::Integer)
+        .unwrap()
+        .plaintext()
+        .index()
+        .column("body", ColumnType::Text)
+        .unwrap()
+        .build()
+        .unwrap();
+    let schemas = vec![parents, children];
+
+    // `exists_insert_child`: one insert leg into `children`, guarded by an
+    // `exists()` assert that reads `parents` — a read against a different
+    // table/leg than the write.
+    let action = Action {
+        name: "exists_insert_child".into(),
+        legs: vec![ActionLeg::Insert {
+            table: "children".into(),
+        }],
+        asserts: vec![Assertion::Exists {
+            table: "parents".into(),
+            predicate: AccessRule::comparison(
+                RuleValue::column(ColumnNamespace::Resource, "id"),
+                ComparisonOp::Equal,
+                RuleValue::column(ColumnNamespace::SelfRow, "parent_id"),
+            ),
+        }],
+    };
+
+    let transport = LocalTransport::new(&schemas, None, Some(1_000))
+        .await
+        .unwrap();
+    transport
+        .import_actions(std::slice::from_ref(&action), &BTreeMap::new())
+        .await
+        .unwrap();
+    let app_root = transport.get_root_hash().await.unwrap();
+    let space = Space::create(transport, ApplicationSchema::for_testing(schemas, app_root))
+        .await
+        .unwrap();
+    space.register_action(action);
+
+    // Seed a parent so the action's cross-leg `exists()` assert is satisfied.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Parent {
+        id: Option<i64>,
+        name: String,
+    }
+    let parent_id = space
+        .table::<Parent>("parents")
+        .insert(&Parent {
+            id: None,
+            name: "anchor".to_string(),
+        })
+        .execute()
+        .await
+        .expect("parent insert");
+
+    // The action inserts into `children` while reading `parents` (cross-leg),
+    // driven through the real recorder→finalize→replayer seam in `handle_change`.
+    let child_id = space
+        .call_insert_action(
+            "exists_insert_child",
+            vec![
+                ("parent_id".into(), QueryParam::Integer(parent_id)),
+                ("body".into(), QueryParam::Text("hello".to_string())),
+            ],
+        )
+        .await
+        .expect("cross-leg action insert must be accepted through the proven path");
+    assert!(child_id > 0, "action must assign a child row id");
 }

@@ -40,3 +40,7 @@ uuid = { workspace = true }
 #   cargo build -p encrypted-spaces-backend-server --features real-proofs,cuda
 real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
 cuda = ["encrypted-spaces-ffproof/cuda"]
+mrt = [
+    "encrypted-spaces-backend/mrt",
+    "encrypted-spaces-ffproof/mrt",
+]

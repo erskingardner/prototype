@@ -12,6 +12,7 @@ message DbRequest {
     RemoveMemberRequest remove_member = 6;
     FetchMyKeyDeliveryRequest fetch_my_key_delivery = 8;
     RetentionRequest retention = 9;
+    RawReadRequest raw_read = 7;
   }
 }
 
@@ -27,6 +28,7 @@ message DbResponse {
     RemoveMemberResponse remove_member = 8;
     FetchMyKeyDeliveryResponse fetch_my_key_delivery = 10;
     RetentionResponse retention = 11;
+    RawReadResponse raw_read = 9;
   }
 }
 
@@ -39,6 +41,23 @@ message SelectRequest {
 message SelectResponse {
   bytes proof = 1;
   repeated bytes values_sidecar = 2;    // Full bytes for hash-backed columns; receiver re-hashes.
+}
+
+// Raw changelog read against the current data commitment, for records stored
+// under raw keys (e.g. the tree filesystem's `/_fs` namespace) rather than
+// table-column keys. A key read proves inclusion; a prefix read proves the
+// COMPLETE set of keys under the prefix (the client rejects an omitted entry).
+message RawReadRequest {
+  oneof target {
+    bytes key = 1;                      // single-key read
+    bytes prefix = 2;                   // all keys under this prefix (one-level listing)
+  }
+  bytes commitment = 3;                 // client DC; server proves against its current root
+}
+
+message RawReadResponse {
+  bytes proof = 1;                      // Merk (range) proof; the verified (key,value) entries
+                                        // are recovered by the client from the proof itself.
 }
 
 message ChangeRequest {

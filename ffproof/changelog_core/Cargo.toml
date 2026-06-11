@@ -18,8 +18,9 @@ serde_json = { workspace = true }
 
 merk = { workspace = true }
 
-# Tracer dependencies for create_trace re-export
-ffproof-tracer = { path = "../tracer" }
+# Shared tracer seam (WriteOp / TraceReplayer / TraceReader). The host
+# `ffproof-tracer` (transcript `create_trace`) edge is severed; it is ported
+# separately and only the integration benches still call `create_trace`.
 ffproof-tracer-shared = { path = "../tracer/shared" }
 
 # Storage encoding for key construction (users_row_key, etc.)
@@ -27,6 +28,7 @@ encrypted-spaces-storage-encoding = { workspace = true }
 
 [features]
 bench-timing = []
+mrt = ["ffproof-tracer-shared/mrt"]
 
 [dev-dependencies]
 serde = { workspace = true }

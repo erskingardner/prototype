@@ -33,10 +33,10 @@ use encrypted_spaces_changelog_core::changelog::{
     FastForwardJournal, FastForwardRange, LogMessage,
 };
 use encrypted_spaces_changelog_core::changelog::{Change, OpType, ROOT_TREE_PATH};
-use encrypted_spaces_changelog_core::{create_trace, encode_pruned_compact};
+use encrypted_spaces_changelog_core::WriteOp;
 use encrypted_spaces_changelog_test_utils::{init_test_server_state, sign_test_change};
 use encrypted_spaces_ffproof::common::FFProof;
-use encrypted_spaces_ffproof::prover::{extract_input_steps, prove_ff_chunk};
+use encrypted_spaces_ffproof::prover::{extract_trace_bytes, prove_ff_chunk};
 use encrypted_spaces_ffproof_methods_bench::{EXTEND_FF_BENCH_ELF, EXTEND_FF_BENCH_ID};
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest, SimpleKeyId};
 use encrypted_spaces_sdk::local_transport::LocalTransport;
@@ -44,6 +44,7 @@ use encrypted_spaces_sdk::schema::{ApplicationSchema, ColumnType, SchemaBuilder}
 use encrypted_spaces_sdk::transport::{EphemeralReceiver, Transport};
 use encrypted_spaces_sdk::Space;
 use encrypted_spaces_sdk::{List, List as ListAlias};
+use ffproof_tracer_shared::TraceRecorder;
 use risc0_zkvm::{default_prover, ExecutorEnv};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -225,25 +226,12 @@ impl Server {
         let start_idx = state.changelog.proven_up_to;
 
         let t0 = std::time::Instant::now();
-        let steps = extract_input_steps(
-            &state.changelog,
-            &state.change_responses,
-            start_idx,
-            tree_snapshot,
-        )
-        .expect("extract_input_steps failed");
-        eprintln!("  [prove] extract_input_steps in {:.2?}", t0.elapsed());
-
-        let t1 = std::time::Instant::now();
-        let tracer_proof = create_trace(tree_snapshot, &steps);
-        eprintln!("  [prove] create_trace in {:.2?}", t1.elapsed());
-
-        let t2 = std::time::Instant::now();
-        let tracer_proof_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+        let tracer_proof_bytes = extract_trace_bytes(&state.changelog, start_idx, tree_snapshot)
+            .expect("extract_trace_bytes failed");
         eprintln!(
-            "  [prove] serialize pruned_tree ({} bytes) in {:.2?}",
+            "  [prove] extract_trace_bytes ({} bytes) in {:.2?}",
             tracer_proof_bytes.len(),
-            t2.elapsed()
+            t0.elapsed()
         );
         let t3 = std::time::Instant::now();
         let _quiet = SuppressStderr::new();
@@ -604,16 +592,9 @@ async fn prove_pending_changes_bench(
         .as_ref()
         .expect("No tree snapshot — state should have one after init");
 
-    let steps = extract_input_steps(
-        &state.changelog,
-        &state.change_responses,
-        start_idx,
-        tree_snapshot,
-    )
-    .expect("extract_input_steps failed");
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let tracer_proof_compact_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+    let tracer_proof_compact_bytes =
+        extract_trace_bytes(&state.changelog, start_idx, tree_snapshot)
+            .expect("extract_trace_bytes failed");
     let is_first = bench_chain.proof.is_none();
 
     let tail_changelog = state.changelog.get_tail(start_idx);
@@ -749,16 +730,9 @@ fn assert_timed_matches_production(state: &SpaceState, start_idx: usize) {
     };
 
     let tree_snapshot = state.tree_snapshot.as_ref().unwrap();
-    let steps = extract_input_steps(
-        &state.changelog,
-        &state.change_responses,
-        start_idx,
-        tree_snapshot,
-    )
-    .unwrap();
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let pruned_tree_bytes = postcard::to_allocvec(&tracer_proof.pruned_tree).unwrap();
-    let pruned_tree_bench_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
+    // Production and timed verify now consume the same merk trace witness, so a
+    // single `extract_trace_bytes` feeds both `verify_op_sequence` variants.
+    let witness_bytes = extract_trace_bytes(&state.changelog, start_idx, tree_snapshot).unwrap();
 
     let tail = state.changelog.get_tail(start_idx);
     let tail_responses = &state.change_responses[start_idx..];
@@ -781,7 +755,7 @@ fn assert_timed_matches_production(state: &SpaceState, start_idx: usize) {
     let result_prod = verify_op_sequence(
         &entries,
         &range,
-        &pruned_tree_bytes,
+        &witness_bytes,
         0,
         &mut sigref_prod,
         &mut recent_roots_prod,
@@ -797,7 +771,7 @@ fn assert_timed_matches_production(state: &SpaceState, start_idx: usize) {
     let (result_timed, _timings) = verify_op_sequence_timed(
         &entries,
         &range,
-        &pruned_tree_bench_bytes,
+        &witness_bytes,
         0,
         &mut sigref_timed,
         &mut recent_roots_timed,
@@ -1132,16 +1106,25 @@ async fn build_cycle_fixture() -> CycleFixture {
             ));
         }
         let t_batch = std::time::Instant::now();
-        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        // `apply_write_ops` applies in issue order (no sort — AVL is
+        // write-order sensitive); the rebased genesis captures the result root.
+        let write_ops: Vec<WriteOp> = batch
+            .into_iter()
+            .map(|(key, op)| match op {
+                merk::Op::Put(value) => WriteOp::Put { key, value },
+                merk::Op::Delete => WriteOp::Delete { key },
+                merk::Op::DeleteRange(end) => WriteOp::DeleteRange { start: key, end },
+            })
+            .collect();
         eprintln!(
-            "  [setup] built+sorted {} kv ops in {:.2?}",
-            batch.len(),
+            "  [setup] built {} kv ops in {:.2?}",
+            write_ops.len(),
             t_batch.elapsed()
         );
 
         let t_tx = std::time::Instant::now();
-        eprint!("  [setup] merk apply_batch ...");
-        s.db.merk.apply_batch(&batch).unwrap();
+        eprint!("  [setup] merk apply_write_ops ...");
+        s.db.merk.apply_write_ops(&write_ops).unwrap();
         eprintln!(" done in {:.2?}", t_tx.elapsed());
 
         let t_snap = std::time::Instant::now();
@@ -1151,7 +1134,7 @@ async fn build_cycle_fixture() -> CycleFixture {
         s.change_responses.clear();
         s.ff_proof = None;
         bench_chain = BenchProofChain::new();
-        s.tree_snapshot = s.db.snapshot();
+        s.tree_snapshot = s.db.checkpoint();
         // Mirror `reinitialize_changelog`: clear the per-user sigref view
         // alongside the changelog reset. The CreateSpace above advanced
         // sigref_map[creator]; without this the first SDK change (sig_ref=0)
@@ -2175,7 +2158,7 @@ async fn build_noop_benchmarks() -> HashMap<&'static str, u64> {
         let root = state.get_root_hash().await;
 
         if state.changelog.num_changes() as usize == state.changelog.proven_up_to {
-            state.tree_snapshot = state.db.snapshot();
+            state.tree_snapshot = state.db.checkpoint();
         }
 
         for _ in 0..count {
@@ -2206,10 +2189,12 @@ async fn build_noop_benchmarks() -> HashMap<&'static str, u64> {
             sign_change(&mut entry, &key_pair);
 
             let tree_snapshot = state.tree_snapshot.as_ref().expect("tree_snapshot");
-            let steps = vec![];
-            let tracer_proof = create_trace(tree_snapshot, &steps);
-            let pruned_merkle_tree =
-                postcard::to_allocvec(&tracer_proof.pruned_tree).expect("serialize pruned tree");
+            // A noop writes nothing: an empty recorder trace (authenticated
+            // against the unchanged root) is the witness the per-change
+            // verifier replays.
+            let pruned_merkle_tree = TraceRecorder::new(tree_snapshot)
+                .finalize_trace()
+                .expect("finalize empty noop trace");
 
             state
                 .changelog

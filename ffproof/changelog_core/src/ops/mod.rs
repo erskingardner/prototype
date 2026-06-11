@@ -14,7 +14,8 @@ pub mod remove_user_op;
 pub mod update_op;
 
 use crate::changelog::{ChangelogEntry, ChangelogError, KvData, OpType, MAX_LOGMSG_ENTRIES};
-use crate::{BatchOp, ProvenRead, ReadOp, TraceStep};
+use crate::native_ops::NativeOp;
+use crate::{ProvenRead, ReadOp, WriteOp};
 use encrypted_spaces_acl_types::{AccessRule, Action, ActionBody};
 use encrypted_spaces_storage_encoding::keys::{
     acl_only_via_actions_key, acl_rule_key, action_storage_key, column_key, decode_action_value,
@@ -1216,7 +1217,7 @@ pub(crate) fn read_auto_increment(
 /// `num_rows == 0`, mirroring the server's behaviour of omitting the
 /// counter `Put` for empty chain inserts.
 pub(crate) fn bump_next_id_after_chain(
-    batch_ops: &mut Vec<BatchOp>,
+    batch_ops: &mut Vec<WriteOp>,
     table: &str,
     counter: i64,
     num_rows: i64,
@@ -1253,9 +1254,9 @@ pub(crate) fn next_id_after(
     })
 }
 
-/// Build a `BatchOp::Put` that writes the new next_id value for a table.
-pub(crate) fn next_id_put(table: &str, next_id: i64) -> BatchOp {
-    BatchOp::Put {
+/// Build a `WriteOp::Put` that writes the new next_id value for a table.
+pub(crate) fn next_id_put(table: &str, next_id: i64) -> WriteOp {
+    WriteOp::Put {
         key: schema_next_id_key(table),
         value: next_id.to_be_bytes().to_vec(),
     }
@@ -1297,7 +1298,7 @@ pub(crate) fn read_schema_list_columns(
     Ok(lc)
 }
 
-/// Build a `BatchOp::Put` for an index entry from a raw column value.
+/// Build a `WriteOp::Put` for an index entry from a raw column value.
 ///
 /// Parses `value_bytes` as JSON, converts to `TupleElement`, constructs the
 /// index key, and returns a Put with the row_id as the value.
@@ -1307,25 +1308,25 @@ pub(crate) fn make_index_put(
     value_bytes: &[u8],
     row_id: i64,
     op_name: &str,
-) -> Result<BatchOp, ChangelogError> {
+) -> Result<WriteOp, ChangelogError> {
     let idx_key = build_index_key(table, column, value_bytes, row_id, op_name)?;
     let row_id_bytes = row_id_to_bytes(row_id);
-    Ok(BatchOp::Put {
+    Ok(WriteOp::Put {
         key: idx_key,
         value: row_id_bytes.to_vec(),
     })
 }
 
-/// Build a `BatchOp::Delete` for an index entry from a raw column value.
+/// Build a `WriteOp::Delete` for an index entry from a raw column value.
 pub(crate) fn make_index_delete(
     table: &str,
     column: &str,
     value_bytes: &[u8],
     row_id: i64,
     op_name: &str,
-) -> Result<BatchOp, ChangelogError> {
+) -> Result<WriteOp, ChangelogError> {
     let idx_key = build_index_key(table, column, value_bytes, row_id, op_name)?;
-    Ok(BatchOp::Delete { key: idx_key })
+    Ok(WriteOp::Delete { key: idx_key })
 }
 
 /// Construct an index key from raw JSON column value bytes.
@@ -1425,7 +1426,7 @@ fn inline_values_by_column<'a>(
 /// [`validate_consistent_column_key_row_id`] (or equivalent) so that index
 /// entries can never be bound to a row_id different from the column writes.
 pub(crate) fn append_insert_index_puts(
-    batch_ops: &mut Vec<BatchOp>,
+    batch_ops: &mut Vec<WriteOp>,
     table: &str,
     row_id: i64,
     entries: &[KvData],
@@ -1449,7 +1450,7 @@ pub(crate) fn append_insert_index_puts(
 /// columns whose signed placeholder value differs from the stored value).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_insert_index_puts_skip(
-    batch_ops: &mut Vec<BatchOp>,
+    batch_ops: &mut Vec<WriteOp>,
     table: &str,
     row_id: i64,
     entries: &[KvData],
@@ -1491,7 +1492,7 @@ pub(crate) fn append_insert_index_puts_skip(
 /// Chunks column keys by schema column count and delegates each chunk
 /// to [`append_insert_index_puts`], validating row_id consistency per chunk.
 pub(crate) fn append_multi_row_insert_index_puts(
-    batch_ops: &mut Vec<BatchOp>,
+    batch_ops: &mut Vec<WriteOp>,
     table: &str,
     column_keys: &[Vec<u8>],
     entries: &[KvData],
@@ -1802,34 +1803,31 @@ pub(crate) fn read_kh_ranges_indexed(
 
 /// Trait for reading from the tree during op validation.
 ///
-/// Operations call `reader.read(op)` inline to request data.  Two implementations
-/// exist:
+/// Operations call `reader.read(op)` inline to request data, which lets them do
+/// adaptive, multi-round reads (read → compute → read again) without declaring
+/// the read-set statically up front.
 ///
-/// * **`ProverReader`** — logs each `ReadOp` and resolves it via a
-///   caller-provided function, returning a real `ProvenRead` with tree data.
-///   This enables adaptive reads (inspect one result to decide the next).
-///   The logged reads are later emitted as `InputStep::Read` entries for
-///   `create_trace`.
+/// The production implementation is
+/// [`HandleReader`](crate::HandleReader): it runs an op's reads against a merk
+/// traced handle — a `TraceRecorder` on the prove side, a `TraceReplayer` on
+/// verify — so the same op code drives both. The handle records its own
+/// read-set and authenticates reads against the witness, so there is no separate
+/// "logged reads" step.
 ///
-/// * **`VerifierReader`** — replays pre-resolved `ProvenRead` entries from the
-///   tracer proof, verifying that the op requests the same reads in the same
-///   order.  Returns an error on mismatch.
-///
-/// This design allows ops to perform adaptive, multi-round reads (read →
-/// compute → read again) without declaring them statically up front.
+/// `ProverReader` and `VerifierReader` below are **test helpers** (resolve reads
+/// via a closure / replay a fixed `&[ProvenRead]`), used by the op unit tests.
 pub trait OpReader {
     /// Perform a read operation, returning the proven result.
     fn read(&mut self, op: ReadOp) -> Result<ProvenRead, ChangelogError>;
 }
 
-/// Prover-side reader: logs `ReadOp`s and resolves them via a caller-provided
+/// Test helper reader: logs `ReadOp`s and resolves them via a caller-provided
 /// function.
 ///
-/// The resolver receives the `ReadOp` and returns a `ProvenRead` with real
-/// data from the tree.  This allows ops to perform adaptive reads (inspect
-/// the result of one read to decide the next) during the prover's discovery
-/// pass.  The logged reads are later emitted as `InputStep::Read` entries
-/// for `create_trace`.
+/// The resolver receives the `ReadOp` and returns a `ProvenRead` with caller-
+/// supplied data, letting op unit tests drive adaptive reads (inspect the result
+/// of one read to decide the next). Production uses
+/// [`HandleReader`](crate::HandleReader) over a real merk traced handle instead.
 pub struct ProverReader<F>
 where
     F: FnMut(&ReadOp) -> Result<ProvenRead, ChangelogError>,
@@ -1924,8 +1922,19 @@ impl OpReader for VerifierReader<'_> {
 #[derive(Debug)]
 pub struct OpVerifyResult {
     /// Tree write operations produced by this op, constructed from the
-    /// changelog entry and the input's row_key.
-    pub write_steps: Vec<TraceStep>,
+    /// changelog entry and the input's row_key. Applied in vector order by
+    /// the seam (no sort/dedup — AVL is write-order sensitive).
+    pub write_steps: Vec<WriteOp>,
+}
+
+/// Test helper: the key a `Put`/`Delete` [`WriteOp`] targets. p2 ops only emit
+/// `Put`/`Delete`, so other variants are unreachable in these tests.
+#[cfg(test)]
+pub(crate) fn write_op_key(op: &WriteOp) -> &[u8] {
+    match op {
+        WriteOp::Put { key, .. } | WriteOp::Delete { key } => key,
+        other => panic!("unexpected write op variant in test: {other:?}"),
+    }
 }
 
 // ─── StaticMetadataCache ────────────────────────────────────────────────────
@@ -2082,6 +2091,7 @@ pub fn dispatch_extract_and_validate(
         OpType::Extend => ExtendOp::extract_and_validate(entry, reader, ctx),
         OpType::Reduce => ReduceOp::extract_and_validate(entry, reader, ctx),
         OpType::Rekey => RekeyOp::extract_and_validate(entry, reader, ctx),
+        OpType::Native => NativeOp::extract_and_validate(entry, reader, ctx),
         OpType::Action => ActionOp::extract_and_validate(entry, reader, ctx),
         OpType::Noop => Ok(OpVerifyResult {
             write_steps: Vec::new(),
@@ -2115,9 +2125,10 @@ pub fn extract_row_id_from_invite_user_proof(
 
     let mut row_ids = BTreeSet::new();
     for op in &writes {
+        // Only `Put`s create `_users` rows; p2 ops never emit range/prefix/move.
         let key = match op {
-            BatchOp::Put { key, .. } => key,
-            BatchOp::Delete { .. } => continue,
+            WriteOp::Put { key, .. } => key,
+            _ => continue,
         };
         match parse_key(key) {
             Ok(ParsedKey::Column { table, row_id, .. }) if table == USERS_TABLE => {
