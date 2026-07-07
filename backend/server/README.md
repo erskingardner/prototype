@@ -40,6 +40,12 @@ With `--space-root`, each Space stores restart-durable state under:
 <space-root>/<space_id>/files/
 ```
 
+This durable state is not encrypted at rest by the server. It may include
+server-visible metadata, plaintext application columns, hash-backed value
+sidecars, changelog witnesses, and pending group-key delivery envelopes.
+Protect `<space-root>` with the same filesystem permissions, backup policy,
+and disk-encryption expectations as application data.
+
 If `--space-root` is omitted, Space state remains memory-only and file
 blobs are stored in temporary per-process directories.
 
@@ -303,6 +309,10 @@ A GPU (Bonsai or a CUDA `r0vm`) is required for efficient proving.
   reloads it from SQLite on first access after restart. If
   `SERVER_SPACE_ROOT` is unset, the server remains memory-only and does
   not survive restart.
+- **At-rest sensitivity:** the `/data` volume is not encrypted by the server.
+  It can contain server-visible metadata, plaintext columns, hash-backed
+  sidecars, changelog witnesses, file blobs, and pending group-key delivery
+  envelopes. Protect the volume like application data.
 - **Single-writer:** each process owns its in-memory per-space state, so do
   not run multiple replicas against the same `/data` volume expecting shared
   state.
