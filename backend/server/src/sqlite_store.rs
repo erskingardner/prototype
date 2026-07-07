@@ -1,4 +1,5 @@
 use crate::db::{ServerError, SpaceState};
+use crate::durable_store::{DurableSpaceStateStore, LoadedSpaceState};
 use crate::key_delivery::GroupKeyDeliverySlots;
 use encrypted_spaces_backend::merk_storage::{FlatMerkEntries, MerkStorage};
 use encrypted_spaces_backend::SpaceId;
@@ -31,18 +32,6 @@ struct PersistedMeta {
     key_delivery_slots: Vec<u8>,
 }
 
-pub struct LoadedSpaceState {
-    pub db: MerkStorage,
-    pub changelog: ChangeLog,
-    pub change_responses: Vec<ChangeResponse>,
-    pub ff_proof: Option<FFProof>,
-    pub tree_snapshot: Option<merk::Node>,
-    pub tree_snapshot_entries: FlatMerkEntries,
-    pub sigref_map: BTreeMap<u32, u32>,
-    pub hash_store: HashMap<[u8; 32], Vec<u8>>,
-    pub key_delivery_slots: GroupKeyDeliverySlots,
-}
-
 impl SqliteSpaceStore {
     pub fn new(artifact_dir: impl Into<PathBuf>) -> Self {
         let artifact_dir = artifact_dir.into();
@@ -53,16 +42,18 @@ impl SqliteSpaceStore {
         }
     }
 
-    pub fn db_exists(&self) -> bool {
-        self.db_path.exists()
-    }
-
     #[cfg(test)]
     pub(crate) fn db_path(&self) -> &std::path::Path {
         &self.db_path
     }
+}
 
-    pub fn save(&self, state: &SpaceState) -> Result<(), ServerError> {
+impl DurableSpaceStateStore for SqliteSpaceStore {
+    fn state_exists(&self) -> bool {
+        self.db_path.exists()
+    }
+
+    fn save(&self, state: &SpaceState) -> Result<(), ServerError> {
         fs::create_dir_all(&self.artifact_dir).map_err(|e| {
             ServerError::Generic(format!(
                 "sqlite store: failed to create artifact directory '{}': {e}",
@@ -168,10 +159,7 @@ impl SqliteSpaceStore {
         tx.commit().map_err(sqlite_error)
     }
 
-    pub fn load(
-        &self,
-        expected_space_id: SpaceId,
-    ) -> Result<Option<LoadedSpaceState>, ServerError> {
+    fn load(&self, expected_space_id: SpaceId) -> Result<Option<LoadedSpaceState>, ServerError> {
         if !self.db_path.exists() {
             return Ok(None);
         }
@@ -323,7 +311,9 @@ impl SqliteSpaceStore {
             key_delivery_slots,
         }))
     }
+}
 
+impl SqliteSpaceStore {
     fn open(&self) -> Result<Connection, ServerError> {
         let conn = Connection::open(&self.db_path).map_err(sqlite_error)?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)

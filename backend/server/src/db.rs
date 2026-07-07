@@ -1,6 +1,7 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
+use crate::durable_store::{DurableSpaceStateStore, LoadedSpaceState};
 use crate::key_delivery::GroupKeyDeliverySlots;
-use crate::sqlite_store::{LoadedSpaceState, SqliteSpaceStore};
+use crate::sqlite_store::SqliteSpaceStore;
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
 use encrypted_spaces_backend::internal_schemas::RETENTION_TABLE_NAME;
@@ -160,8 +161,8 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
-    /// Durable store for this space, present only when `--space-root` is set.
-    sqlite_store: Option<SqliteSpaceStore>,
+    /// Durable state store for this space, present only when `--space-root` is set.
+    durable_store: Option<Box<dyn DurableSpaceStateStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +342,10 @@ fn space_artifact_path(space_root: &str, space_id: SpaceId) -> String {
         .into_owned()
 }
 
+fn durable_store_for_artifact_path(artifact_path: &str) -> Box<dyn DurableSpaceStateStore> {
+    Box::new(SqliteSpaceStore::new(PathBuf::from(artifact_path)))
+}
+
 /// Get or create the state for the given space.
 ///
 /// The artifact path is derived from `app_cfg.space_root` (or temporary if none),
@@ -502,26 +507,23 @@ impl SpaceState {
         let store = init_cfg
             .artifact_path
             .as_ref()
-            .map(|artifact_path| SqliteSpaceStore::new(PathBuf::from(artifact_path)));
+            .map(|artifact_path| durable_store_for_artifact_path(artifact_path));
 
         if let Some(store) = store {
-            if store.db_exists() {
+            if store.state_exists() {
                 let loaded = store.load(init_cfg.space_id)?.ok_or_else(|| {
                     ServerError::Generic(format!(
-                        "space={} sqlite DB exists but no persisted state was found",
+                        "space={} durable state exists but no persisted state was found",
                         init_cfg.space_id
                     ))
                 })?;
-                log::info!("space={} restoring durable SQLite state", init_cfg.space_id);
+                log::info!("space={} restoring durable state", init_cfg.space_id);
                 return Self::from_loaded_state(init_cfg, ff_batch_size, store, loaded);
             }
 
-            log::info!(
-                "space={} initializing new durable SQLite state",
-                init_cfg.space_id
-            );
+            log::info!("space={} initializing new durable state", init_cfg.space_id);
             let mut state = Self::init_server(None, Some(init_cfg), ff_batch_size).await?;
-            state.sqlite_store = Some(store);
+            state.durable_store = Some(store);
             state.persist_now("initial space creation")?;
             return Ok(state);
         }
@@ -532,7 +534,7 @@ impl SpaceState {
     fn from_loaded_state(
         init_cfg: SpaceInitConfig,
         ff_batch_size: Option<usize>,
-        store: SqliteSpaceStore,
+        store: Box<dyn DurableSpaceStateStore>,
         loaded: LoadedSpaceState,
     ) -> Result<Self, ServerError> {
         let artifact_path = init_cfg.artifact_path.clone();
@@ -560,7 +562,7 @@ impl SpaceState {
             sigref_map: loaded.sigref_map,
             verbose_logfile: init_cfg.verbose_logfile,
             hash_store: loaded.hash_store,
-            sqlite_store: Some(store),
+            durable_store: Some(store),
         };
 
         log::info!(
@@ -579,7 +581,7 @@ impl SpaceState {
     }
 
     fn persist_now(&self, context: &str) -> Result<(), ServerError> {
-        if let Some(store) = &self.sqlite_store {
+        if let Some(store) = &self.durable_store {
             store.save(self).map_err(|e| {
                 ServerError::Generic(format!(
                     "space={} failed to persist after {context}: {e}",
@@ -663,7 +665,7 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
-            sqlite_store: None,
+            durable_store: None,
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {

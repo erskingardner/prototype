@@ -4,6 +4,7 @@ pub use encrypted_spaces_backend::SpaceId;
 
 pub mod app_config;
 pub mod db;
+pub mod durable_store;
 pub mod file_store;
 pub mod key_delivery;
 pub mod sqlite_store;
