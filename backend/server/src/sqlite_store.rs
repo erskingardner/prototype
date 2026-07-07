@@ -136,23 +136,33 @@ impl DurableSpaceStateStore for SqliteSpaceStore {
 
         {
             let mut stmt = tx
-                .prepare("INSERT INTO merk_entries (key, value) VALUES (?1, ?2)")
+                .prepare("INSERT INTO merk_entries (position, key, value) VALUES (?1, ?2, ?3)")
                 .map_err(sqlite_error)?;
             // Preserve export order: MerkStorage replays these entries one at a
             // time, and that order preserves the authenticated tree shape.
-            for (key, value) in &merk_entries {
-                stmt.execute(params![key.as_slice(), value.as_slice()])
-                    .map_err(sqlite_error)?;
+            for (position, (key, value)) in merk_entries.iter().enumerate() {
+                stmt.execute(params![
+                    entry_position(position)?,
+                    key.as_slice(),
+                    value.as_slice()
+                ])
+                .map_err(sqlite_error)?;
             }
         }
 
         {
             let mut stmt = tx
-                .prepare("INSERT INTO ff_batch_base_entries (key, value) VALUES (?1, ?2)")
+                .prepare(
+                    "INSERT INTO ff_batch_base_entries (position, key, value) VALUES (?1, ?2, ?3)",
+                )
                 .map_err(sqlite_error)?;
-            for (key, value) in &state.tree_snapshot_entries {
-                stmt.execute(params![key.as_slice(), value.as_slice()])
-                    .map_err(sqlite_error)?;
+            for (position, (key, value)) in state.tree_snapshot_entries.iter().enumerate() {
+                stmt.execute(params![
+                    entry_position(position)?,
+                    key.as_slice(),
+                    value.as_slice()
+                ])
+                .map_err(sqlite_error)?;
             }
         }
 
@@ -350,11 +360,13 @@ impl SqliteSpaceStore {
             );
 
             CREATE TABLE IF NOT EXISTS merk_entries (
+                position INTEGER NOT NULL UNIQUE,
                 key BLOB PRIMARY KEY,
                 value BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS ff_batch_base_entries (
+                position INTEGER NOT NULL UNIQUE,
                 key BLOB PRIMARY KEY,
                 value BLOB NOT NULL
             );
@@ -367,9 +379,9 @@ impl SqliteSpaceStore {
         conn: &Connection,
         table_name: &'static str,
     ) -> Result<FlatMerkEntries, ServerError> {
-        // Row order mirrors insertion order from save(); sorted key order can
-        // rebuild a different valid tree shape with a different root hash.
-        let sql = format!("SELECT key, value FROM {table_name} ORDER BY rowid");
+        // Rebuild in the exact export order saved by `save`; sorted key order
+        // can rebuild a different valid tree shape with a different root hash.
+        let sql = format!("SELECT key, value FROM {table_name} ORDER BY position");
         let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
         let rows = stmt
             .query_map([], |row| {
@@ -390,6 +402,12 @@ fn unix_timestamp() -> Result<i64, ServerError> {
     })?;
     i64::try_from(duration.as_secs())
         .map_err(|_| ServerError::Generic("sqlite store: unix timestamp exceeds i64".to_string()))
+}
+
+fn entry_position(position: usize) -> Result<i64, ServerError> {
+    i64::try_from(position).map_err(|_| {
+        ServerError::Generic("sqlite store: entry position exceeds i64 range".to_string())
+    })
 }
 
 fn sqlite_error(error: rusqlite::Error) -> ServerError {
@@ -518,6 +536,17 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(found, table);
+        }
+
+        for table in ["merk_entries", "ff_batch_base_entries"] {
+            let found: String = conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info(?1) WHERE name = 'position'",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, "position");
         }
 
         let _ = fs::remove_dir_all(dir);
@@ -655,8 +684,12 @@ mod tests {
         conn.execute("DELETE FROM ff_batch_base_entries", [])
             .unwrap();
         conn.execute(
-            "INSERT INTO ff_batch_base_entries (key, value) VALUES (?1, ?2)",
-            params![b"not-the-real-snapshot".as_slice(), b"value".as_slice()],
+            "INSERT INTO ff_batch_base_entries (position, key, value) VALUES (?1, ?2, ?3)",
+            params![
+                0i64,
+                b"not-the-real-snapshot".as_slice(),
+                b"value".as_slice()
+            ],
         )
         .unwrap();
 

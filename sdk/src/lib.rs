@@ -1248,6 +1248,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn durable_restart_preserves_invite_join_and_rekey_delivery() -> Result<()> {
+        init_test_logging();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let space_id = SpaceId::random();
+        let artifact_path = temp_dir
+            .path()
+            .join(space_id.to_string())
+            .to_string_lossy()
+            .into_owned();
+        let transport = LocalTransport::durable(space_id, artifact_path.clone(), None).await?;
+        let alice = Space::create(transport.clone(), schema()).await?;
+
+        let invite = alice.invite_user().await?;
+        transport
+            .restart_from_durable_store(space_id, artifact_path.clone(), None)
+            .await?;
+
+        let before_join_fetches = transport.fetch_my_key_delivery_calls();
+        let bob = Space::join(transport.clone(), invite, schema()).await?;
+        assert_eq!(
+            transport.fetch_my_key_delivery_calls(),
+            before_join_fetches + 1,
+            "join after restart must fetch the persisted invite delivery slot"
+        );
+
+        alice.sync().await?;
+        let before_alice_rekey_fetches = transport.fetch_my_key_delivery_calls();
+        alice.rekey().await?;
+        assert!(
+            transport.fetch_my_key_delivery_calls() > before_alice_rekey_fetches,
+            "rekey initiator must recover through its delivery slot"
+        );
+
+        transport
+            .restart_from_durable_store(space_id, artifact_path, None)
+            .await?;
+
+        let before_bob_sync_fetches = transport.fetch_my_key_delivery_calls();
+        bob.sync().await?;
+        assert!(
+            transport.fetch_my_key_delivery_calls() > before_bob_sync_fetches,
+            "sync after restart must fetch Bob's persisted rekey delivery slot"
+        );
+
+        let users: Vec<crate::users::UserRecord> = bob.users().select().all().await?;
+        assert_eq!(users.len(), 2);
+
+        Ok(())
+    }
+
     /// Stage 6 — a client that missed a fresh-random rekey recovers its HGK
     /// from the delivery slot on the next `sync()`.
     #[tokio::test]

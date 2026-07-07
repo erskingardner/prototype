@@ -93,6 +93,9 @@ impl LocalTransport {
     }
 
     /// Create a new LocalTransport with predefined schemas.
+    ///
+    /// `artifact_path` is passed through to the server's file store. Use
+    /// [`Self::durable`] when the server state itself should survive restart.
     pub async fn new(
         schemas: &[Schema],
         artifact_path: Option<String>,
@@ -114,6 +117,57 @@ impl LocalTransport {
             files: Arc::new(Mutex::new(HashMap::new())),
             fetch_my_key_delivery_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Create a LocalTransport backed by the server's durable per-space store.
+    pub async fn durable(
+        space_id: SpaceId,
+        artifact_path: impl Into<String>,
+        ff_batch_size: Option<usize>,
+    ) -> Result<Self> {
+        let state = Self::restore_durable_state(space_id, artifact_path, ff_batch_size).await?;
+        Ok(Self::from_state(state))
+    }
+
+    /// Replace the shared in-process server with state restored from disk.
+    ///
+    /// Existing cloned transports keep their auth contexts and point at the
+    /// restored server state, which lets tests model a server restart without
+    /// rebuilding every SDK client handle.
+    pub async fn restart_from_durable_store(
+        &self,
+        space_id: SpaceId,
+        artifact_path: impl Into<String>,
+        ff_batch_size: Option<usize>,
+    ) -> Result<()> {
+        let state = Self::restore_durable_state(space_id, artifact_path, ff_batch_size).await?;
+        *self.state.lock().await = state;
+        Ok(())
+    }
+
+    async fn restore_durable_state(
+        space_id: SpaceId,
+        artifact_path: impl Into<String>,
+        ff_batch_size: Option<usize>,
+    ) -> Result<SpaceState> {
+        let init_cfg = SpaceInitConfig {
+            space_id,
+            artifact_path: Some(artifact_path.into()),
+            verbose_logfile: None,
+            bootstrap_data: BootstrapDataSource::None,
+        };
+        SpaceState::init_or_restore_server(init_cfg, ff_batch_size)
+            .await
+            .map_err(|e| SdkError::DatabaseError(format!("Failed to restore durable server: {e}")))
+    }
+
+    fn from_state(state: SpaceState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            auth_context: Mutex::new(AuthContext::new(None, SpaceId::from([0u8; 16]))),
+            files: Arc::new(Mutex::new(HashMap::new())),
+            fetch_my_key_delivery_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     /// Create a `LocalTransport` whose initial state mirrors what a real

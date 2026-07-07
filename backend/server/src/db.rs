@@ -176,6 +176,12 @@ struct AppliedChangeProof {
     pruned_merkle_tree: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangePersistence {
+    Immediate,
+    Deferred,
+}
+
 fn removed_user_ids_in_change(delete_change: &ChangelogEntry) -> BTreeSet<i64> {
     delete_change
         .message
@@ -500,7 +506,9 @@ impl SpaceState {
     /// Default batch size for FF proof generation
     pub const DEFAULT_FF_BATCH_SIZE: usize = 5;
 
-    async fn init_or_restore_server(
+    /// Initialize a space, restoring from its durable store when
+    /// `init_cfg.artifact_path` points at an existing per-space database.
+    pub async fn init_or_restore_server(
         init_cfg: SpaceInitConfig,
         ff_batch_size: Option<usize>,
     ) -> Result<Self, ServerError> {
@@ -2193,6 +2201,16 @@ impl SpaceState {
         change: &Change,
         auth: &AuthContext,
     ) -> Result<ChangeResponse, ServerError> {
+        self.handle_change_with_persistence(change, auth, ChangePersistence::Immediate)
+            .await
+    }
+
+    async fn handle_change_with_persistence(
+        &mut self,
+        change: &Change,
+        auth: &AuthContext,
+        persistence: ChangePersistence,
+    ) -> Result<ChangeResponse, ServerError> {
         let entry = &change.entry;
         if auth.uid.is_none() {
             return Err(ServerError::Generic("Missing user's UID".to_string()));
@@ -2330,7 +2348,9 @@ impl SpaceState {
         self.change_responses.push(response.clone());
 
         self.maybe_generate_ff_proof()?;
-        self.persist_or_terminate("change");
+        if persistence == ChangePersistence::Immediate {
+            self.persist_or_terminate("change");
+        }
 
         Ok(response)
     }
@@ -2761,8 +2781,21 @@ impl SpaceState {
         )
         .await?;
 
+        let ciphertext = ciphertexts
+            .get(0)
+            .ok_or_else(|| ServerError::Generic("missing ciphertext for new member".to_string()))?;
+        let envelope = GkDeliveryEnvelope {
+            binding_commitment: request.root_commitment,
+            ciphertext,
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+            ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
+        })?;
+
         // 5. Insert the new user record as a tracked changelog entry.
-        let change_response = self.handle_change(insert_change, auth).await?;
+        let change_response = self
+            .handle_change_with_persistence(insert_change, auth, ChangePersistence::Deferred)
+            .await?;
 
         // 6. Extract the newly assigned user ID from the invite user proof.
         let new_user_id = extract_row_id_from_invite_user_proof(
@@ -2775,20 +2808,10 @@ impl SpaceState {
         .map_err(|e| ServerError::Generic(format!("extract row id failed: {e:?}")))?;
 
         // 7. Write the invite envelope into the new user's GK delivery slot.
-        //    Slot updates are best-effort key-delivery state; the canonical
-        //    insert above has already committed.
-        let ciphertext = ciphertexts
-            .get(0)
-            .ok_or_else(|| ServerError::Generic("missing ciphertext for new member".to_string()))?;
-        let envelope = GkDeliveryEnvelope {
-            binding_commitment: request.root_commitment,
-            ciphertext: ciphertext.clone(),
-        };
-        let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
-            ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
-        })?;
+        //    The tracked change and delivery slot are persisted together after
+        //    all in-memory state for this outer operation is complete.
         self.key_delivery_slots.put(new_user_id, envelope_bytes);
-        self.persist_or_terminate("add_member key delivery update");
+        self.persist_or_terminate("add_member");
 
         Ok(change_response)
     }
@@ -2871,17 +2894,8 @@ impl SpaceState {
         )
         .await?;
 
-        // 5. Execute the change.
-        let change_response = self.handle_change(delete_change, auth).await?;
-
-        // 7. Clear the removed user's delivery slot.
-        for row_id in removed_user_ids_in_change(&delete_change.entry) {
-            self.key_delivery_slots.remove(row_id);
-        }
-
-        // 8. Refresh each remaining member's GK delivery slot with their
-        //    rekey envelope. Slot writes are best-effort; the canonical
-        //    retention mutation has already committed above.
+        let removed_user_ids: Vec<i64> = removed_in_change.iter().copied().collect();
+        let mut delivery_envelopes = Vec::with_capacity(remaining_members.len());
         for (i, (uid, _)) in remaining_members.iter().enumerate() {
             let ciphertext = ciphertexts.get(i).ok_or_else(|| {
                 ServerError::Generic(format!("missing ciphertext for member index {i}"))
@@ -2893,9 +2907,25 @@ impl SpaceState {
             let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
                 ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
             })?;
-            self.key_delivery_slots.put(*uid, envelope_bytes);
+            delivery_envelopes.push((*uid, envelope_bytes));
         }
-        self.persist_or_terminate("remove_member key delivery update");
+
+        // 5. Execute the change.
+        let change_response = self
+            .handle_change_with_persistence(delete_change, auth, ChangePersistence::Deferred)
+            .await?;
+
+        // 6. Clear the removed user's delivery slot.
+        for row_id in removed_user_ids {
+            self.key_delivery_slots.remove(row_id);
+        }
+
+        // 7. Refresh each remaining member's GK delivery slot with their
+        //    rekey envelope, then persist the full outer operation together.
+        for (uid, envelope_bytes) in delivery_envelopes {
+            self.key_delivery_slots.put(uid, envelope_bytes);
+        }
+        self.persist_or_terminate("remove_member");
 
         Ok(change_response)
     }
@@ -2973,15 +3003,23 @@ impl SpaceState {
             None
         };
 
-        // 3. Execute the change.
-        let change_response = self.handle_change(change, auth).await?;
+        // 3. Execute the change. Rekeys defer persistence until delivery
+        //    slots are refreshed below.
+        let persistence = if delivery_envelopes.is_some() {
+            ChangePersistence::Deferred
+        } else {
+            ChangePersistence::Immediate
+        };
+        let change_response = self
+            .handle_change_with_persistence(change, auth, persistence)
+            .await?;
 
         // 4. Write delivery slots if rekey.
         if let Some(envelopes) = delivery_envelopes {
             for (uid, envelope_bytes) in envelopes {
                 self.key_delivery_slots.put(uid, envelope_bytes);
             }
-            self.persist_or_terminate("retention key delivery update");
+            self.persist_or_terminate("retention rekey");
         }
 
         Ok(change_response)
