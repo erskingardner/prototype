@@ -474,7 +474,16 @@ fn expected_tree_snapshot_root(
 mod tests {
     use super::*;
     use crate::app_config::{BootstrapDataSource, SpaceInitConfig};
-    use encrypted_spaces_backend::merk_storage::Op;
+    use encrypted_spaces_backend::internal_schemas::USERS_TABLE_NAME;
+    use encrypted_spaces_backend::merk_storage::{column_key_placeholder, stored_value, Op};
+    use encrypted_spaces_backend::schema::{ColumnDefinition, ColumnType, Schema};
+    use encrypted_spaces_backend::storage::Storage;
+    use encrypted_spaces_changelog_core::changelog::{
+        Change, ChangelogEntry, HashedValues, OpType, ROOT_TREE_PATH,
+    };
+    use serde_json::Value;
+
+    const TEST_TABLE_NAME: &str = "sqlite_store_notes";
 
     fn temp_dir(test_name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -498,6 +507,85 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn append_applied_change(state: &mut SpaceState, change: Change) -> [u8; 32] {
+        let current_change_id = state.changelog.num_changes() as usize + 1;
+        let old_root = state.db.root_hash();
+        let pruned_merkle_tree = state
+            .db
+            .apply_change_with_pruned_tree(&change, current_change_id)
+            .await
+            .expect("test change should apply");
+        let new_root = state.db.root_hash();
+        let change_id = state
+            .changelog
+            .add_change(&change.entry, &pruned_merkle_tree, &old_root, &new_root)
+            .expect("test change should append to changelog");
+        state.change_responses.push(ChangeResponse {
+            old_root,
+            new_root,
+            pruned_merkle_tree,
+            change_id,
+            rows_affected: 1,
+            accepted_at_server_time: ChangelogEntry::get_unix_timestamp(),
+            hashed_values: HashedValues::new(),
+        });
+        new_root
+    }
+
+    async fn apply_create_space_change(state: &mut SpaceState) -> [u8; 32] {
+        let update_key_column = column_key_placeholder(USERS_TABLE_NAME, "update_key");
+        let auth_key_column = column_key_placeholder(USERS_TABLE_NAME, "auth_key");
+        let status_column = column_key_placeholder(USERS_TABLE_NAME, "status");
+        let update_key_value = stored_value::value_to_bytes(&Value::String("update-key".into()))
+            .expect("update_key should encode");
+        let auth_key_value = stored_value::value_to_bytes(&Value::String("auth-key".into()))
+            .expect("auth_key should encode");
+        let status_value =
+            stored_value::value_to_bytes(&Value::from(1)).expect("status value should encode");
+        let change = Change::new(
+            OpType::CreateSpace,
+            1,
+            ROOT_TREE_PATH,
+            &[
+                update_key_column.as_slice(),
+                auth_key_column.as_slice(),
+                status_column.as_slice(),
+            ],
+            &[
+                update_key_value.as_slice(),
+                auth_key_value.as_slice(),
+                status_value.as_slice(),
+            ],
+            state.changelog.num_changes(),
+            state.changelog.num_changes(),
+            state.changelog.current_root(),
+        )
+        .expect("create-space change should build");
+        append_applied_change(state, change).await
+    }
+
+    async fn apply_test_insert_change(state: &mut SpaceState, label: &str) -> [u8; 32] {
+        let key_column = column_key_placeholder(TEST_TABLE_NAME, "key");
+        let value_column = column_key_placeholder(TEST_TABLE_NAME, "value");
+        let key_value = stored_value::value_to_bytes(&Value::String(format!("key-{label}")))
+            .expect("key value should encode");
+        let value_value = stored_value::value_to_bytes(&Value::String(format!("value-{label}")))
+            .expect("test value should encode");
+        let parent_change = state.changelog.num_changes();
+        let change = Change::new(
+            OpType::Insert,
+            1,
+            ROOT_TREE_PATH,
+            &[key_column.as_slice(), value_column.as_slice()],
+            &[key_value.as_slice(), value_value.as_slice()],
+            parent_change,
+            parent_change,
+            state.changelog.current_root(),
+        )
+        .expect("test change should build");
+        append_applied_change(state, change).await
     }
 
     #[test]
@@ -623,6 +711,89 @@ mod tests {
             .iter()
             .any(|(key, _)| key == &stale_key));
         assert!(loaded.tree_snapshot.is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restore_validates_mid_batch_ff_snapshot_root() {
+        let dir = temp_dir("mid_batch_snapshot");
+        let store = SqliteSpaceStore::new(dir.join("space"));
+        let mut state = test_state(SpaceId::random()).await;
+        state
+            .db
+            .create_table(&Schema {
+                name: TEST_TABLE_NAME.to_string(),
+                columns: vec![
+                    ColumnDefinition {
+                        name: "id".to_string(),
+                        column_type: ColumnType::Integer,
+                        plaintext: true,
+                        indexed: false,
+                    },
+                    ColumnDefinition {
+                        name: "key".to_string(),
+                        column_type: ColumnType::String,
+                        plaintext: true,
+                        indexed: false,
+                    },
+                    ColumnDefinition {
+                        name: "value".to_string(),
+                        column_type: ColumnType::String,
+                        plaintext: true,
+                        indexed: false,
+                    },
+                ],
+                auto_increment: true,
+            })
+            .await
+            .unwrap();
+        state.reinitialize_changelog().await.unwrap();
+
+        apply_create_space_change(&mut state).await;
+        let batch_snapshot_root = apply_test_insert_change(&mut state, "one").await;
+        // This test targets snapshot-root restore validation, not RISC0 proof
+        // deserialization. An empty payload still advances the changelog's
+        // proven boundary and exercises the mid-batch root branch.
+        state.changelog.set_ff_proof(Vec::new(), 2);
+        state.tree_snapshot_entries = state.db.export_entries().unwrap();
+        state.tree_snapshot = state.db.snapshot();
+
+        let live_root = apply_test_insert_change(&mut state, "two").await;
+        assert_ne!(batch_snapshot_root, live_root);
+        assert_eq!(state.changelog.proven_up_to, 2);
+        assert_eq!(state.change_responses.len(), 3);
+
+        store.save(&state).unwrap();
+        let loaded = store.load(state.space_id).unwrap().unwrap();
+        assert_eq!(loaded.db.root_hash(), live_root);
+        assert_eq!(loaded.changelog.proven_up_to, 2);
+        assert_eq!(
+            loaded
+                .tree_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.hash()),
+            Some(batch_snapshot_root)
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute("DELETE FROM ff_batch_base_entries", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ff_batch_base_entries (position, key, value)
+             SELECT position, key, value FROM merk_entries",
+            [],
+        )
+        .unwrap();
+
+        let err = match store.load(state.space_id) {
+            Err(err) => err,
+            Ok(_) => panic!("restore should fail on a live-root FF snapshot"),
+        };
+        assert!(
+            err.to_string().contains("FF batch snapshot root mismatch"),
+            "{err}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
