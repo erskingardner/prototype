@@ -1064,10 +1064,8 @@ fn kept_walks_from_proof_entries(
             Ok(ParsedKey::Index { row_id, .. }) if on_indexed => {
                 walks.push((row_id, key.clone()));
             }
-            Ok(ParsedKey::Column { row_id, .. }) if !on_indexed => {
-                if seen_rows.insert(row_id) {
-                    walks.push((row_id, keys::row_key(&query.table, row_id)));
-                }
+            Ok(ParsedKey::Column { row_id, .. }) if !on_indexed && seen_rows.insert(row_id) => {
+                walks.push((row_id, keys::row_key(&query.table, row_id)));
             }
             _ => {}
         }

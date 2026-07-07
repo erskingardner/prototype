@@ -5,28 +5,25 @@
 //! member's slot; the recipient fetches it via `fetch_my_key_delivery` once
 //! their local retention snapshot is current.
 //!
-//! Slot writes are intentionally **not transactional** with the underlying
-//! retention mutation: the canonical commit happens first, then slots are
-//! updated best-effort in runtime memory. Retention-specific envelope
+//! Slot writes are committed after the underlying retention mutation: the
+//! canonical commit happens first, then slots are updated in server state and
+//! persisted when durable per-space storage is enabled. Retention-specific envelope
 //! construction, binding-commitment semantics, and when-to-fetch policy all
 //! live in the retention implementation (`retention::simple_line2` for SL2
 //! today); this module only stores and hands back opaque per-recipient bytes.
 //!
 //! # Persistence
 //!
-//! Slots are runtime-owned state, not canonical database rows:
-//!
-//! - the authoritative retention state lives in the changelog + `_retention`;
-//! - slots are lost on process restart because there is no durable slot store;
-//! - a recipient whose slot was lost that way, and who has missed a key
-//!   rotation, must wait for another rotation to be able to recover a usable
-//!   group key. This tradeoff is acceptable because losing a slot never leaves
-//!   canonical retention state inconsistent.
+//! Slots are not canonical database rows — the authoritative retention state
+//! still lives in the changelog + `_retention` — but the server persists slot
+//! bytes in its per-space SQLite state when `SERVER_SPACE_ROOT` / `--space-root`
+//! is configured so pending invite/rekey envelopes survive restart.
 
 use std::collections::HashMap;
 
 use encrypted_spaces_backend::access_control::AuthContext;
 use encrypted_spaces_backend::proto::{self, db_response, DbResponse};
+use serde::{Deserialize, Serialize};
 
 use crate::app_config::AppConfig;
 use crate::db::{error_response, get_or_create_space, ok_response, SpaceState};
@@ -36,7 +33,7 @@ use crate::db::{error_response, get_or_create_space, ok_response, SpaceState};
 /// Each slot stores the serialized [`GkDeliveryEnvelope`] bytes addressed to
 /// that recipient. Slots are overwritten in place on accepted rekey/add-user
 /// events and removed when a user is removed from the space.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct GroupKeyDeliverySlots {
     pub slots: HashMap<i64, Vec<u8>>,
 }

@@ -15,7 +15,7 @@ pub struct CliArgs {
     #[arg(long = "schema", env = "SERVER_DEFAULT_SCHEMA_PATH")]
     pub schema: Option<String>,
 
-    /// Root directory for per-space local artifacts.
+    /// Root directory for per-space durable SQLite state and file blobs.
     #[arg(long = "space-root", env = "SERVER_SPACE_ROOT")]
     pub space_root: Option<String>,
 
@@ -89,7 +89,8 @@ pub enum BootstrapDataSource {
 pub struct SpaceInitConfig {
     /// The space this configuration applies to.
     pub space_id: SpaceId,
-    /// Per-space artifact directory, or `None` for temporary local artifacts.
+    /// Per-space artifact directory, or `None` for memory-only server state
+    /// with temporary file storage.
     pub artifact_path: Option<String>,
     /// Path for verbose file-based logging, if any.
     pub verbose_logfile: Option<String>,
@@ -101,7 +102,7 @@ pub struct SpaceInitConfig {
 pub struct AppConfig {
     /// If specified, used for verbose file-based logging.
     pub verbose_logfile: Option<String>,
-    /// The root directory for per-space local artifacts.
+    /// The root directory for per-space durable SQLite state and file blobs.
     pub space_root: Option<String>,
     /// Optional schema bundle for all new spaces.
     pub bootstrap_data: BootstrapDataSource,

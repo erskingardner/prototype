@@ -64,6 +64,7 @@ pub type RowData = (
     serde_json::Map<String, serde_json::Value>,
     Vec<(String, Vec<u8>)>,
 );
+pub type FlatMerkEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Primary key field for all tables
 pub const ID_FIELD: &str = "id";
@@ -152,6 +153,41 @@ impl MerkStorage {
 
     pub fn apply_batch_ops(&self, ops: Vec<Operation>) -> Result<()> {
         self.apply_batch(ops)
+    }
+
+    /// Export every key/value entry currently stored in the in-memory Merk tree.
+    ///
+    /// This is intentionally a flat key/value snapshot, not a serialized
+    /// `merk::Node`, so callers can persist and rebuild storage without
+    /// depending on Merk's private tree representation. Entries are emitted in
+    /// level order; replaying them one at a time preserves the existing AVL
+    /// shape for the live in-memory tree, and therefore the data commitment.
+    pub fn export_entries(&self) -> Result<FlatMerkEntries> {
+        let Some(tree) = self.merk.snapshot() else {
+            return Ok(Vec::new());
+        };
+
+        let mut entries = Vec::new();
+        let mut queue = std::collections::VecDeque::from([tree]);
+        while let Some(node) = queue.pop_front() {
+            entries.push((node.key().to_vec(), node.value().to_vec()));
+            if let Some(left) = node.child(true) {
+                queue.push_back(left.clone());
+            }
+            if let Some(right) = node.child(false) {
+                queue.push_back(right.clone());
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Rebuild in-memory Merk storage from a flat key/value export.
+    pub fn from_entries(entries: FlatMerkEntries) -> Result<Self> {
+        let storage = Self::new();
+        for (key, value) in entries {
+            storage.apply_batch_ops(vec![(key, Op::Put(value))])?;
+        }
+        Ok(storage)
     }
 
     /// Execute a batch of operations against the in-memory tree.

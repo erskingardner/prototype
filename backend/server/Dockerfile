@@ -287,8 +287,8 @@ VOLUME ["/data"]
 # Listen on all interfaces by default; users can override via env.
 # SERVER_SPACE_ROOT is intentionally NOT set: keep the existing
 # "in-memory unless explicitly persistent" signal — defaulting to
-# /data would silently lose data on `docker rm` without a mounted
-# volume. Users opt in with:
+# /data would make SQLite state and file blobs look durable until
+# `docker rm` unless a mounted volume is present. Users opt in with:
 #   -v encrypted-spaces-data:/data -e SERVER_SPACE_ROOT=/data
 #
 # SERVER_DEFAULT_SCHEMA_PATH points at the schema baked in above so

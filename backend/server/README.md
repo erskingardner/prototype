@@ -8,7 +8,7 @@ Each request is executed against a Merk database on the server, and results are 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--schema <path>` | `SERVER_DEFAULT_SCHEMA_PATH` | — | Schema file applied to every new Space (`.kdl` or JSON `SchemaBundle`) |
-| `--space-root <path>` | `SERVER_SPACE_ROOT` | — | Root directory for per-Space local artifacts |
+| `--space-root <path>` | `SERVER_SPACE_ROOT` | — | Root directory for per-Space durable SQLite state and file blobs |
 | `--bind-addr <host>` | `BIND_ADDR` | `127.0.0.1` | Host address to bind |
 | `--port <port>` | `PORT` | `8080` | HTTP port |
 | `--tls-port <port>` | `TLS_PORT` | `8443` | TLS port (used instead of `--port` when TLS is configured) |
@@ -32,6 +32,16 @@ cargo run -p encrypted-spaces-backend-server -- \
   --schema ./demos/tauri/app_schema.kdl \
   --space-root ./spaces
 ```
+
+With `--space-root`, each Space stores restart-durable state under:
+
+```text
+<space-root>/<space_id>/db.sqlite3
+<space-root>/<space_id>/files/
+```
+
+If `--space-root` is omitted, Space state remains memory-only and file
+blobs are stored in temporary per-process directories.
 
 ### Custom address and port
 
@@ -226,8 +236,7 @@ docker run --rm -p 8080:8080 \
   encrypted-spaces-server:dev
 ```
 
-Persistent file-blob store (the Merk DB stays in-memory regardless;
-see "Volumes and ports" below):
+Restart-durable per-space SQLite DBs and file-blob store:
 
 ```bash
 docker volume create encrypted-spaces-data
@@ -256,7 +265,7 @@ variables. Image defaults:
 | `TLS_PORT`         | `8443`       | Used instead of `PORT` when TLS is configured |
 | `RUST_LOG`         | `info`       | |
 | `RISC0_DEV_MODE`   | `1`          | Fake proofs (matches the dev-mode build) |
-| `SERVER_SPACE_ROOT`| *(unset)*    | Set to `/data` to persist per-space file blobs; the Merk database is in-memory regardless and is lost on container restart |
+| `SERVER_SPACE_ROOT`| *(unset)*    | Set to `/data` to persist per-space SQLite DBs and file blobs under `/data/<space_id>/` |
 | `SERVER_DEFAULT_SCHEMA_PATH` | `/etc/encrypted-spaces/app_schema.kdl` | The demo schema (`demos/tauri/app_schema.kdl`) is baked into the image at this path. Override to point at a mounted schema file (KDL or JSON) if you need a different one |
 | `TLS_CERT_PATH` / `TLS_KEY_PATH` | *(unset)* | PEM files; mount them into the container |
 
@@ -288,12 +297,15 @@ A GPU (Bonsai or a CUDA `r0vm`) is required for efficient proving.
 
 ### Volumes and ports
 
-- `VOLUME /data` — per-space **file store** (binary blobs uploaded via
-  `/file/<hash>`). The Merk relational database itself is in-memory only
-  and **does not survive restart**. Use `SERVER_DEFAULT_SCHEMA_PATH`
-  to bootstrap schema for new spaces at startup. **Single-writer:** each process owns its
-  own in-memory state, so do not run multiple replicas against the
-  same `/data` volume expecting shared state.
+- `VOLUME /data` — when `SERVER_SPACE_ROOT=/data` is set, each Space writes
+  `/data/<space_id>/db.sqlite3` plus `/data/<space_id>/files/`. The live
+  proof/query engine still uses in-memory Merk while the process runs, and
+  reloads it from SQLite on first access after restart. If
+  `SERVER_SPACE_ROOT` is unset, the server remains memory-only and does
+  not survive restart.
+- **Single-writer:** each process owns its in-memory per-space state, so do
+  not run multiple replicas against the same `/data` volume expecting shared
+  state.
 - `EXPOSE 8080 8443` — HTTP + TLS, only one is active at a time
   (TLS is selected automatically when `TLS_CERT_PATH` and
   `TLS_KEY_PATH` are both set).

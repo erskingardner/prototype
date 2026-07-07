@@ -1,5 +1,6 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
 use crate::key_delivery::GroupKeyDeliverySlots;
+use crate::sqlite_store::{LoadedSpaceState, SqliteSpaceStore};
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
 use encrypted_spaces_backend::internal_schemas::RETENTION_TABLE_NAME;
@@ -7,7 +8,7 @@ use encrypted_spaces_backend::internal_schemas::{
     is_internal_table, is_reserved_table_name, LISTS_TABLE_NAME, USERS_TABLE_NAME,
 };
 use encrypted_spaces_backend::merk_storage::{
-    group_columns_into_rows_by_table_resolving_hashes, parse_key, Op, ParsedKey,
+    group_columns_into_rows_by_table_resolving_hashes, parse_key, FlatMerkEntries, Op, ParsedKey,
 };
 use encrypted_spaces_backend::sign_change::verify_change_signature;
 pub use encrypted_spaces_backend::SpaceId;
@@ -47,7 +48,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::{fs, io::Write};
+use std::{fs, io::Write, path::PathBuf};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 type AuthVerifyingKey = <Ed25519Signature as Signature>::VerificationKey;
@@ -128,8 +129,6 @@ pub(crate) fn op_name(op: &Option<db_request::Operation>) -> &'static str {
 }
 
 /// The state a server has to keep for a [`Space`].
-///
-/// TODO: Currently persisted in memory only, but should be stored durably.
 pub struct SpaceState {
     pub db: MerkStorage,
     pub changelog: ChangeLog,
@@ -139,9 +138,13 @@ pub struct SpaceState {
     /// A copy of the tree at the time ff_proof was created. When we create the next proof,
     /// we need the tree and a list of operations we'll apply to it.
     pub tree_snapshot: Option<merk::Node>,
+    /// Flat key/value copy of `tree_snapshot`, persisted so reloads can rebuild
+    /// the FF batch-start tree without serializing `merk::Node`.
+    pub tree_snapshot_entries: FlatMerkEntries,
     /// Batch size for FF proof generation - a new proof is generated every N changes
     pub ff_batch_size: usize,
-    /// Per-recipient GK delivery slots (runtime state, not DB-persisted).
+    /// Per-recipient GK delivery slots, persisted with server state when
+    /// durable per-space storage is enabled.
     pub key_delivery_slots: GroupKeyDeliverySlots,
     /// The space this server state belongs to.
     pub space_id: SpaceId,
@@ -157,6 +160,8 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Durable store for this space, present only when `--space-root` is set.
+    sqlite_store: Option<SqliteSpaceStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +323,7 @@ fn build_init_cfg(space_id: SpaceId, app_cfg: Option<&AppConfig>) -> Option<Spac
         let artifact_path = cfg
             .space_root
             .as_ref()
-            .map(|base| format!("{}/{}", base, space_id));
+            .map(|base| space_artifact_path(base, space_id));
 
         SpaceInitConfig {
             space_id,
@@ -327,6 +332,13 @@ fn build_init_cfg(space_id: SpaceId, app_cfg: Option<&AppConfig>) -> Option<Spac
             bootstrap_data: cfg.bootstrap_data.clone(),
         }
     })
+}
+
+fn space_artifact_path(space_root: &str, space_id: SpaceId) -> String {
+    PathBuf::from(space_root)
+        .join(space_id.to_string())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Get or create the state for the given space.
@@ -350,9 +362,9 @@ pub(crate) async fn get_or_create_space(
         verbose_logfile: None,
         bootstrap_data: BootstrapDataSource::None,
     });
-    let state = SpaceState::init_server(None, Some(init_cfg), None)
+    let state = SpaceState::init_or_restore_server(init_cfg, None)
         .await
-        .expect("Failed to initialize space state");
+        .expect("Failed to initialize or restore space state");
     let arc = Arc::new(Mutex::new(state));
     map.insert(space_id, arc.clone());
     arc
@@ -483,6 +495,109 @@ impl SpaceState {
     /// Default batch size for FF proof generation
     pub const DEFAULT_FF_BATCH_SIZE: usize = 5;
 
+    async fn init_or_restore_server(
+        init_cfg: SpaceInitConfig,
+        ff_batch_size: Option<usize>,
+    ) -> Result<Self, ServerError> {
+        let store = init_cfg
+            .artifact_path
+            .as_ref()
+            .map(|artifact_path| SqliteSpaceStore::new(PathBuf::from(artifact_path)));
+
+        if let Some(store) = store {
+            if store.db_exists() {
+                let loaded = store.load(init_cfg.space_id)?.ok_or_else(|| {
+                    ServerError::Generic(format!(
+                        "space={} sqlite DB exists but no persisted state was found",
+                        init_cfg.space_id
+                    ))
+                })?;
+                log::info!("space={} restoring durable SQLite state", init_cfg.space_id);
+                return Self::from_loaded_state(init_cfg, ff_batch_size, store, loaded);
+            }
+
+            log::info!(
+                "space={} initializing new durable SQLite state",
+                init_cfg.space_id
+            );
+            let mut state = Self::init_server(None, Some(init_cfg), ff_batch_size).await?;
+            state.sqlite_store = Some(store);
+            state.persist_now("initial space creation")?;
+            return Ok(state);
+        }
+
+        Self::init_server(None, Some(init_cfg), ff_batch_size).await
+    }
+
+    fn from_loaded_state(
+        init_cfg: SpaceInitConfig,
+        ff_batch_size: Option<usize>,
+        store: SqliteSpaceStore,
+        loaded: LoadedSpaceState,
+    ) -> Result<Self, ServerError> {
+        let artifact_path = init_cfg.artifact_path.clone();
+        let file_store = {
+            let file_path = if let Some(ref p) = artifact_path {
+                PathBuf::from(p).join("files")
+            } else {
+                std::env::temp_dir()
+                    .join(format!("encrypted-spaces-files-{}", uuid::Uuid::new_v4()))
+            };
+            Some(Arc::new(crate::file_store::FileStore::new(file_path)))
+        };
+
+        let state = Self {
+            db: loaded.db,
+            changelog: loaded.changelog,
+            change_responses: loaded.change_responses,
+            ff_proof: loaded.ff_proof,
+            tree_snapshot: loaded.tree_snapshot,
+            tree_snapshot_entries: loaded.tree_snapshot_entries,
+            ff_batch_size: ff_batch_size.unwrap_or(Self::DEFAULT_FF_BATCH_SIZE),
+            key_delivery_slots: loaded.key_delivery_slots,
+            space_id: init_cfg.space_id,
+            file_store,
+            sigref_map: loaded.sigref_map,
+            verbose_logfile: init_cfg.verbose_logfile,
+            hash_store: loaded.hash_store,
+            sqlite_store: Some(store),
+        };
+
+        log::info!(
+            "space={} restore complete, root={}",
+            state.space_id,
+            hex::encode(state.db.root_hash())
+        );
+
+        Ok(state)
+    }
+
+    fn refresh_tree_snapshot(&mut self) -> Result<(), ServerError> {
+        self.tree_snapshot = self.db.snapshot();
+        self.tree_snapshot_entries = self.db.export_entries().map_err(ServerError::from)?;
+        Ok(())
+    }
+
+    fn persist_now(&self, context: &str) -> Result<(), ServerError> {
+        if let Some(store) = &self.sqlite_store {
+            store.save(self).map_err(|e| {
+                ServerError::Generic(format!(
+                    "space={} failed to persist after {context}: {e}",
+                    self.space_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn persist_or_terminate(&self, context: &str) {
+        if let Err(e) = self.persist_now(context) {
+            log::error!("FATAL: {e}");
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    }
+
     /// Initialize a space with in-memory Merk storage.
     pub async fn init_server(
         schema: Option<&Vec<Schema>>,
@@ -532,6 +647,7 @@ impl SpaceState {
             change_responses: vec![],
             ff_proof: None,
             tree_snapshot: None,
+            tree_snapshot_entries: Vec::new(),
             ff_batch_size,
             key_delivery_slots: GroupKeyDeliverySlots::default(),
             space_id,
@@ -547,6 +663,7 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
+            sqlite_store: None,
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {
@@ -599,7 +716,7 @@ impl SpaceState {
 
         // Take tree snapshot AFTER demo inserts so it matches the state
         // the first tracked change will see as its old_root
-        new_server_state.tree_snapshot = new_server_state.db.snapshot();
+        new_server_state.refresh_tree_snapshot()?;
 
         log::info!(
             "space={sid} init complete, root={}",
@@ -2137,7 +2254,7 @@ impl SpaceState {
         //  inserts (setup/schema/access rules) happened since init.
         let num_changes = self.changelog.num_changes() as usize;
         if num_changes == self.changelog.proven_up_to {
-            self.tree_snapshot = self.db.snapshot();
+            self.refresh_tree_snapshot()?;
         }
 
         let old_root = self.get_root_hash().await;
@@ -2211,6 +2328,7 @@ impl SpaceState {
         self.change_responses.push(response.clone());
 
         self.maybe_generate_ff_proof()?;
+        self.persist_or_terminate("change");
 
         Ok(response)
     }
@@ -2258,12 +2376,13 @@ impl SpaceState {
                     self.space_id, num_changes, e
                 ))
             })?);
-            self.tree_snapshot = Some(self.db.snapshot().ok_or_else(|| {
-                ServerError::Generic(format!(
+            self.refresh_tree_snapshot()?;
+            if self.tree_snapshot.is_none() {
+                return Err(ServerError::Generic(format!(
                     "space={} missing tree snapshot after FF proof update at change {}",
                     self.space_id, num_changes
-                ))
-            })?);
+                )));
+            }
             log::info!(
                 "space={} FF proof updated, proven_up_to={}",
                 self.space_id,
@@ -2667,6 +2786,7 @@ impl SpaceState {
             ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
         })?;
         self.key_delivery_slots.put(new_user_id, envelope_bytes);
+        self.persist_or_terminate("add_member key delivery update");
 
         Ok(change_response)
     }
@@ -2773,6 +2893,7 @@ impl SpaceState {
             })?;
             self.key_delivery_slots.put(*uid, envelope_bytes);
         }
+        self.persist_or_terminate("remove_member key delivery update");
 
         Ok(change_response)
     }
@@ -2858,6 +2979,7 @@ impl SpaceState {
             for (uid, envelope_bytes) in envelopes {
                 self.key_delivery_slots.put(uid, envelope_bytes);
             }
+            self.persist_or_terminate("retention key delivery update");
         }
 
         Ok(change_response)
@@ -3836,6 +3958,115 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "concurrent inits must return the same Arc"
         );
+    }
+
+    fn temp_space_root(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "encrypted_spaces_server_{test_name}_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn forget_space(space_id: SpaceId) {
+        SPACES.lock().await.remove(&space_id);
+    }
+
+    #[tokio::test]
+    async fn disk_backed_space_restores_state_after_registry_drop() {
+        let space_id = SpaceId::random();
+        let root = temp_space_root("restart");
+        let app_cfg = AppConfig {
+            space_root: Some(root.to_str().unwrap().to_string()),
+            verbose_logfile: None,
+            bootstrap_data: BootstrapDataSource::None,
+        };
+
+        let space = get_or_create_space(space_id, Some(&app_cfg)).await;
+        {
+            let mut state = space.lock().await;
+            let auth = AuthContext::new(None, space_id);
+
+            state
+                .db
+                .insert(
+                    Query::new(
+                        RETENTION_TABLE_NAME.to_string(),
+                        QueryOperation::Insert(vec![
+                            (
+                                "key".to_string(),
+                                QueryParam::Text("durable-key".to_string()),
+                            ),
+                            (
+                                "value".to_string(),
+                                QueryParam::Blob(b"durable-value".to_vec()),
+                            ),
+                        ]),
+                    ),
+                    &auth,
+                )
+                .await
+                .unwrap();
+
+            state.reinitialize_changelog().await.unwrap();
+            state.sigref_map.insert(9, 4);
+            state
+                .hash_store
+                .insert([0x44; 32], b"encrypted material".to_vec());
+            state.key_delivery_slots.put(2, b"invite envelope".to_vec());
+            state.key_delivery_slots.put(3, b"stale envelope".to_vec());
+            state.key_delivery_slots.remove(3);
+            state.key_delivery_slots.put(4, b"rekey envelope".to_vec());
+            state.refresh_tree_snapshot().unwrap();
+            state.persist_now("test mutation").unwrap();
+        }
+
+        forget_space(space_id).await;
+
+        let restored = get_or_create_space(space_id, Some(&app_cfg)).await;
+        let state = restored.lock().await;
+        assert!(state.db.get_schema(USERS_TABLE_NAME).is_ok());
+
+        let mut query = Query::new(
+            RETENTION_TABLE_NAME.to_string(),
+            QueryOperation::Select(vec!["key".to_string()]),
+        );
+        query.predicate = Some(Predicate {
+            column: "key".to_string(),
+            operator: ComparisonOperator::Equal,
+            values: vec![QueryParam::Text("durable-key".to_string())],
+            cursor_id: None,
+        });
+        let rows = state.db.query_rows(&query).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("key").and_then(|v| v.as_str()),
+            Some("durable-key")
+        );
+
+        assert_eq!(state.sigref_map.get(&9), Some(&4));
+        assert_eq!(
+            state.hash_store.get(&[0x44; 32]).map(Vec::as_slice),
+            Some(&b"encrypted material"[..])
+        );
+        assert_eq!(
+            state.get_delivery_slot(2).as_deref(),
+            Some(&b"invite envelope"[..])
+        );
+        assert!(state.get_delivery_slot(3).is_none());
+        assert_eq!(
+            state.get_delivery_slot(4).as_deref(),
+            Some(&b"rekey envelope"[..])
+        );
+        assert_eq!(
+            state.tree_snapshot.as_ref().map(|snapshot| snapshot.hash()),
+            Some(state.db.root_hash())
+        );
+
+        drop(state);
+        forget_space(space_id).await;
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

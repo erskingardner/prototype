@@ -194,7 +194,10 @@ impl LocalTransport {
         state
             .reinitialize_changelog()
             .await
-            .map_err(|e| SdkError::DatabaseError(format!("reinitialize_changelog failed: {e}")))
+            .map_err(|e| SdkError::DatabaseError(format!("reinitialize_changelog failed: {e}")))?;
+        state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot_entries = state.db.export_entries()?;
+        Ok(())
     }
 
     /// Generate the raw proof bytes for a SELECT query at the current root,
@@ -250,6 +253,7 @@ impl LocalTransport {
         state.change_responses.clear();
         state.ff_proof = None;
         state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot_entries = state.db.export_entries()?;
         // Mirror `reinitialize_changelog`: the per-user sigref view is
         // changelog-scoped, so reset it whenever the in-process server
         // resets its changelog baseline. Without this, prior accepted
@@ -307,6 +311,7 @@ impl LocalTransport {
         state.change_responses.clear();
         state.ff_proof = None;
         state.tree_snapshot = state.db.snapshot();
+        state.tree_snapshot_entries = state.db.export_entries()?;
         // Mirror `reinitialize_changelog`: clear the per-user sigref
         // view alongside the changelog reset (see `create_table`).
         state.sigref_map.clear();

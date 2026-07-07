@@ -3,6 +3,7 @@ mod db;
 pub(crate) mod file_store;
 mod http;
 mod key_delivery;
+mod sqlite_store;
 mod tls;
 mod websocket;
 

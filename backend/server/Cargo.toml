@@ -28,6 +28,8 @@ once_cell = { workspace = true }
 prost = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 encrypted-spaces-backend = { workspace = true, features = ["merk"] }

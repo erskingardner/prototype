@@ -64,6 +64,7 @@ rand_chacha = "0.9"
 rand_core = { version = "0.9.3" }
 ratatui = { version = "0.26" }
 rayon = "1.11.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
 ctor = { version = "1" }
 rustls = { version = "0.21", default-features = false, features = ["tls12"] }
 rustls-pemfile = { version = "1.0" }
