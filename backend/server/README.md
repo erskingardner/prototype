@@ -124,6 +124,21 @@ RUST_LOG=info,debug cargo run -p encrypted-spaces-backend-server -- \
   --schema ./demos/tauri/app_schema.kdl
 ```
 
+## WebSocket connection lifecycle
+
+Every upgraded connection must release its registry entry, response channel,
+tasks, and socket after either a normal WebSocket close or a transport-level
+disconnect. The registry previously retained a response sender while the writer
+task retained its receiver and the WebSocket write half. That ownership cycle
+kept the final socket owner alive after the reader stopped.
+
+Cleanup removes the exact connection ID, drops the remaining per-connection
+senders, and bounds writer close/abort and upgrade waits. The server test suite
+repeatedly opens real WebSocket connections and exercises both normal close and
+disconnect-without-close paths, then verifies that the connection registry is
+empty. Accept errors also use capped exponential backoff so resource exhaustion
+cannot turn into a busy loop.
+
 ## Server console commands
 
 ```

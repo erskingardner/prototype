@@ -32,6 +32,62 @@ pub(crate) type ShutdownRx = watch::Receiver<bool>;
 /// in-flight work.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A persistent accept failure (notably EMFILE/ENFILE) leaves a Tokio listener
+/// immediately ready with the same error. Retrying without a delay therefore
+/// becomes a single-core busy loop. Back off all accept errors, reset after the
+/// next successful accept, and cap the delay so recovery remains prompt.
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct AcceptBackoff {
+    next: Duration,
+}
+
+impl AcceptBackoff {
+    fn new() -> Self {
+        Self {
+            next: ACCEPT_BACKOFF_INITIAL,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self
+            .next
+            .checked_mul(2)
+            .unwrap_or(ACCEPT_BACKOFF_MAX)
+            .min(ACCEPT_BACKOFF_MAX);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = ACCEPT_BACKOFF_INITIAL;
+    }
+}
+
+async fn retry_after_accept_error(
+    label: &str,
+    error: &std::io::Error,
+    backoff: &mut AcceptBackoff,
+    shutdown_rx: &mut ShutdownRx,
+) -> bool {
+    let delay = backoff.next_delay();
+    log::warn!("{label} accept error; retrying in {delay:?}: {error}");
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn log_finished_connection_task(label: &str, result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        log::warn!("{label} connection task failed: {error}");
+    }
+}
+
 /// Print a fatal error to stderr in red when stderr is a TTY and `NO_COLOR`
 /// is not set; otherwise print it plainly. See https://no-color.org/.
 fn eprint_error(err: &(dyn std::error::Error + 'static)) {
@@ -199,6 +255,7 @@ async fn run_tls_server(
     let tls_cfg = tls::build_tls_config(cert_path, key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut accept_backoff = AcceptBackoff::new();
 
     loop {
         tokio::select! {
@@ -211,11 +268,26 @@ async fn run_tls_server(
                 }
                 break;
             }
+            task = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(result) = task {
+                    log_finished_connection_task("TLS", result);
+                }
+            }
             accept = listener.accept() => {
                 let (tcp, _) = match accept {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        accept_backoff.reset();
+                        pair
+                    }
                     Err(e) => {
-                        log::warn!("TLS accept error (continuing): {e}");
+                        if !retry_after_accept_error(
+                            "TLS",
+                            &e,
+                            &mut accept_backoff,
+                            &mut shutdown_rx,
+                        ).await {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -224,8 +296,8 @@ async fn run_tls_server(
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
                 tasks.spawn(async move {
-                    match acceptor.accept(tcp).await {
-                        Ok(tls_stream) => {
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                        Ok(Ok(tls_stream)) => {
                             if let Err(err) = hyper::server::conn::Http::new()
                                 .http1_only(true)
                                 .http1_keep_alive(true)
@@ -249,7 +321,11 @@ async fn run_tls_server(
                                 log::debug!("HTTPS connection ended: {err}");
                             }
                         }
-                        Err(e) => log::warn!("TLS accept error (continuing): {e}"),
+                        Ok(Err(e)) => log::warn!("TLS handshake failed: {e}"),
+                        Err(_) => log::warn!(
+                            "TLS handshake timed out after {:?}",
+                            TLS_HANDSHAKE_TIMEOUT
+                        ),
                     }
                 });
             }
@@ -286,6 +362,7 @@ async fn run_http_server(
     listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(listener)?;
     let mut tasks = tokio::task::JoinSet::new();
+    let mut accept_backoff = AcceptBackoff::new();
 
     loop {
         tokio::select! {
@@ -296,11 +373,26 @@ async fn run_http_server(
                 }
                 break;
             }
+            task = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(result) = task {
+                    log_finished_connection_task("HTTP", result);
+                }
+            }
             accept = listener.accept() => {
                 let (tcp, _) = match accept {
-                    Ok(pair) => pair,
+                    Ok(pair) => {
+                        accept_backoff.reset();
+                        pair
+                    }
                     Err(e) => {
-                        log::warn!("HTTP accept error (continuing): {e}");
+                        if !retry_after_accept_error(
+                            "HTTP",
+                            &e,
+                            &mut accept_backoff,
+                            &mut shutdown_rx,
+                        ).await {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -428,4 +520,135 @@ fn spawn_console_command_loop(app_cfg: Arc<AppConfig>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_config::BootstrapDataSource;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::time::Instant;
+
+    #[test]
+    fn accept_backoff_is_nonzero_bounded_and_resets_after_success() {
+        let mut backoff = AcceptBackoff::new();
+        let delays: Vec<_> = (0..12).map(|_| backoff.next_delay()).collect();
+
+        assert_eq!(delays[0], Duration::from_millis(10));
+        assert_eq!(delays[1], Duration::from_millis(20));
+        assert!(delays.iter().all(|delay| !delay.is_zero()));
+        assert!(delays.iter().all(|delay| *delay <= ACCEPT_BACKOFF_MAX));
+        assert_eq!(*delays.last().unwrap(), ACCEPT_BACKOFF_MAX);
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), ACCEPT_BACKOFF_INITIAL);
+    }
+
+    fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).expect("read HTTP response");
+            assert!(read > 0, "connection closed before HTTP headers arrived");
+            response.extend_from_slice(&buffer[..read]);
+            assert!(response.len() < 16 * 1024, "HTTP headers were too large");
+        }
+        response
+    }
+
+    fn open_websocket(address: SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(address).expect("connect to test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request = format!(
+            "GET /ws?space=00000000000000000000000000000000 HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let response = read_http_headers(&mut stream);
+        assert!(
+            response.starts_with(b"HTTP/1.1 101"),
+            "WebSocket upgrade failed: {}",
+            String::from_utf8_lossy(&response)
+        );
+        stream
+    }
+
+    fn close_websocket_normally(mut stream: TcpStream) {
+        // Masked client close frame with status code 1000.
+        stream
+            .write_all(&[0x88, 0x82, 0x11, 0x22, 0x33, 0x44, 0x12, 0xca])
+            .unwrap();
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header).expect("read close reply");
+        assert_eq!(header[0] & 0x0f, 0x08, "server must reply with close");
+    }
+
+    async fn wait_until_registry_stays_empty(registry: &websocket::ConnectionRegistry) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut empty_since = None;
+        loop {
+            if registry.lock().await.is_empty() {
+                let since = empty_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(100) {
+                    return;
+                }
+            } else {
+                empty_since = None;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connection registry did not drain"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_websocket_disconnects_release_connection_state() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let app_cfg = Arc::new(AppConfig {
+            verbose_logfile: None,
+            space_root: None,
+            bootstrap_data: BootstrapDataSource::None,
+        });
+        let registry = websocket::new_connection_registry();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_registry = registry.clone();
+        let server = tokio::spawn(async move {
+            run_http_server(listener, app_cfg, server_registry, shutdown_rx).await
+        });
+
+        tokio::task::spawn_blocking(move || {
+            for cycle in 0..128 {
+                let stream = open_websocket(address);
+                if cycle % 2 == 0 {
+                    close_websocket_normally(stream);
+                } else {
+                    // A transport disconnect without a WebSocket close frame.
+                    stream.shutdown(Shutdown::Write).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        wait_until_registry_stays_empty(&registry).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server shutdown timed out")
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
 }

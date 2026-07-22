@@ -14,9 +14,16 @@ use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 type WsStream = hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>;
+
+/// Bound the two places where a connection task could otherwise retain an
+/// upgraded socket forever: waiting for Hyper to hand over the connection and
+/// waiting for the writer half to flush/close after the reader has stopped.
+const WEBSOCKET_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Process-wide monotonic id used to distinguish individual websocket
 /// connections so broadcasts can skip the originating client.
@@ -33,7 +40,16 @@ fn next_connection_id() -> ConnectionId {
 /// A single client connection within a space.
 pub(crate) struct ClientConnection {
     id: ConnectionId,
-    sender: mpsc::UnboundedSender<Vec<u8>>,
+    sender: mpsc::UnboundedSender<WriterCommand>,
+}
+
+/// Commands sent to the single task that owns the WebSocket write half.
+/// Keeping close/flush on that task avoids concurrent mutable access to the
+/// Tungstenite state shared by the split read and write halves.
+#[derive(Debug)]
+enum WriterCommand {
+    Message(Message),
+    Close,
 }
 
 /// Registry mapping SpaceId -> list of client connections for broadcasts.
@@ -124,7 +140,9 @@ fn send_broadcast_to(broadcast: &ProtoBroadcast, connections: &[&ClientConnectio
     }
     .encode_to_vec();
     for conn in connections {
-        let _ = conn.sender.send(frame.clone());
+        let _ = conn
+            .sender
+            .send(WriterCommand::Message(Message::Binary(frame.clone())));
     }
 }
 
@@ -138,7 +156,9 @@ async fn relay_ephemeral(msg: &Ephemeral, conn_registry: &ConnectionRegistry, sp
     let reg = conn_registry.lock().await;
     if let Some(conns) = reg.get(&space_id) {
         for conn in conns {
-            let _ = conn.sender.send(frame.clone());
+            let _ = conn
+                .sender
+                .send(WriterCommand::Message(Message::Binary(frame.clone())));
         }
     }
 }
@@ -182,7 +202,7 @@ async fn send_broadcast(
 
 fn send_direct_response(
     payload: ws_frame::Payload,
-    response_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    response_tx: &mpsc::UnboundedSender<WriterCommand>,
     space_id: SpaceId,
     label: &str,
 ) {
@@ -191,7 +211,7 @@ fn send_direct_response(
     };
     let bytes = frame.encode_to_vec();
     log::debug!("ws: {label} response len={}B", bytes.len());
-    match response_tx.send(bytes) {
+    match response_tx.send(WriterCommand::Message(Message::Binary(bytes))) {
         Ok(_) => log::debug!("ws: queued {label} response to writer"),
         Err(e) => log::error!("space={space_id} ws: {label} response send failed err={e}"),
     }
@@ -211,7 +231,7 @@ struct ConnectionState {
     app_cfg: Arc<AppConfig>,
     auth: Arc<std::sync::Mutex<Option<AuthContext>>>,
     /// Sends encoded frames directly back to this client (responses, notifications).
-    response_tx: mpsc::UnboundedSender<Vec<u8>>,
+    response_tx: mpsc::UnboundedSender<WriterCommand>,
     /// Connection registry for broadcasts.
     conn_registry: ConnectionRegistry,
 }
@@ -294,11 +314,21 @@ async fn dispatch_frame(frame: WsFrame, state: &ConnectionState) {
 // Read loop
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadLoopExit {
+    /// The peer sent a WebSocket close frame, so flush Tungstenite's close reply.
+    PeerClosed,
+    /// EOF, reset, or another read error: the peer is gone, so just drop our half.
+    PeerGone,
+    /// Process shutdown: initiate a best-effort WebSocket close.
+    Shutdown,
+}
+
 async fn run_read_loop(
     mut read: futures_util::stream::SplitStream<WsStream>,
-    state: ConnectionState,
+    state: &ConnectionState,
     mut shutdown_rx: ShutdownRx,
-) {
+) -> ReadLoopExit {
     loop {
         tokio::select! {
             biased;
@@ -311,17 +341,16 @@ async fn run_read_loop(
                         "space={} ws: shutdown requested, exiting read loop",
                         state.space_id
                     );
-                    break;
+                    return ReadLoopExit::Shutdown;
                 }
             }
             msg = read.next() => {
-                let Some(msg) = msg else { break };
+                let Some(msg) = msg else { return ReadLoopExit::PeerGone };
                 match msg {
-                    Ok(m) if m.is_binary() => {
-                        let data = m.into_data();
+                    Ok(Message::Binary(data)) => {
                         log::debug!("ws: inbound binary len={}B", data.len());
                         match WsFrame::decode(&data[..]) {
-                            Ok(frame) => dispatch_frame(frame, &state).await,
+                            Ok(frame) => dispatch_frame(frame, state).await,
                             Err(e) => {
                                 log::warn!(
                                     "space={} ws: failed to decode WsFrame err={e}",
@@ -330,15 +359,20 @@ async fn run_read_loop(
                             }
                         }
                     }
-                    Ok(m) if m.is_close() => {
+                    Ok(Message::Close(_)) => {
                         log::info!("space={} ws: client requested close", state.space_id);
-                        break;
+                        return ReadLoopExit::PeerClosed;
                     }
-                    Ok(other) => {
-                        if other.is_text() {
-                            log::debug!("ws: ignoring text frame");
-                        }
+                    Ok(Message::Ping(payload)) => {
+                        // Tungstenite queues an automatic pong while reading. Wake
+                        // the writer so the shared state is flushed even when the
+                        // application has no outbound database response pending.
+                        let _ = state.response_tx.send(WriterCommand::Message(
+                            Message::Pong(payload),
+                        ));
                     }
+                    Ok(Message::Text(_)) => log::debug!("ws: ignoring text frame"),
+                    Ok(Message::Pong(_)) => {}
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("Connection reset")
@@ -355,7 +389,7 @@ async fn run_read_loop(
                                 state.space_id
                             );
                         }
-                        break;
+                        return ReadLoopExit::PeerGone;
                     }
                 }
             }
@@ -369,7 +403,7 @@ async fn run_read_loop(
 
 async fn run_write_loop(
     mut write: futures_util::stream::SplitSink<WsStream, Message>,
-    mut response_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut response_rx: mpsc::UnboundedReceiver<WriterCommand>,
     space_id: SpaceId,
     mut shutdown_rx: ShutdownRx,
 ) {
@@ -382,17 +416,23 @@ async fn run_write_loop(
                     log::debug!(
                         "space={space_id} ws: shutdown requested, sending close frame"
                     );
-                    // Best-effort close. Errors here just mean the
-                    // peer already disconnected.
-                    let _ = write.send(Message::Close(None)).await;
+                    // `SinkExt::close` initiates a close when needed and flushes
+                    // an already-queued reply when the peer closed first.
                     let _ = write.close().await;
                     break;
                 }
             }
-            msg = response_rx.recv() => {
-                let Some(msg) = msg else { break };
+            command = response_rx.recv() => {
+                let Some(command) = command else { break };
+                if matches!(command, WriterCommand::Close) {
+                    let _ = write.close().await;
+                    break;
+                }
+                let WriterCommand::Message(msg) = command else {
+                    unreachable!("close command handled above")
+                };
                 log::debug!("ws: writer sending frame len={}B", msg.len());
-                if let Err(e) = write.send(Message::Binary(msg)).await {
+                if let Err(e) = write.send(msg).await {
                     let err_msg = e.to_string();
                     if err_msg.contains("Connection closed")
                         || err_msg.contains("closing handshake")
@@ -419,7 +459,7 @@ async fn register_connection(
     registry: &ConnectionRegistry,
     space_id: SpaceId,
     auth: &AuthContext,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    sender: &mpsc::UnboundedSender<WriterCommand>,
 ) -> ConnectionId {
     let id = next_connection_id();
     let mut reg = registry.lock().await;
@@ -431,15 +471,24 @@ async fn register_connection(
     id
 }
 
-async fn unregister_connection(registry: &ConnectionRegistry, space_id: SpaceId) {
+async fn unregister_connection(
+    registry: &ConnectionRegistry,
+    space_id: SpaceId,
+    connection_id: ConnectionId,
+) {
     let mut reg = registry.lock().await;
     if let Some(connections) = reg.get_mut(&space_id) {
-        connections.retain(|c| !c.sender.is_closed());
+        // Remove this connection unconditionally. The old implementation only
+        // removed senders whose receiver was already closed, but the receiver
+        // lived in the writer task and the registry sender was what kept that
+        // receiver open. That ownership cycle retained the WebSocket write half
+        // (and therefore the accepted TCP socket) forever after client FIN.
+        connections.retain(|c| c.id != connection_id && !c.sender.is_closed());
         if connections.is_empty() {
             reg.remove(&space_id);
         }
     }
-    log::debug!("ws: unregistered closed connections for space={space_id}");
+    log::debug!("ws: unregistered connection id={connection_id} for space={space_id}");
 }
 
 pub async fn client_connected(
@@ -448,15 +497,32 @@ pub async fn client_connected(
     conn_registry: ConnectionRegistry,
     auth: Option<AuthContext>,
     space_id: SpaceId,
-    shutdown_rx: ShutdownRx,
+    mut shutdown_rx: ShutdownRx,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uid = auth.as_ref().and_then(|a| a.uid);
     let auth_ctx = auth.unwrap_or_else(|| AuthContext::anonymous(space_id));
-    let ws_stream = ws.await?;
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+    let ws_stream = tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => return Ok(()),
+        result = tokio::time::timeout(WEBSOCKET_UPGRADE_TIMEOUT, ws) => {
+            match result {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for WebSocket upgrade",
+                    ).into());
+                }
+            }
+        }
+    };
     log::info!("space={space_id} ws: client connected uid={:?}", uid);
 
     let (write, read) = ws_stream.split();
-    let (response_tx, response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (response_tx, response_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
     let auth = Arc::new(std::sync::Mutex::new(Some(auth_ctx.clone())));
 
@@ -472,19 +538,57 @@ pub async fn client_connected(
         conn_registry: conn_registry.clone(),
     };
 
-    let write_handle = tokio::spawn(run_write_loop(
+    let mut write_handle = tokio::spawn(run_write_loop(
         write,
         response_rx,
         space_id,
         shutdown_rx.clone(),
     ));
 
-    run_read_loop(read, state, shutdown_rx).await;
+    // Whichever half stops first owns connection teardown. Selecting the
+    // writer prevents a write error from leaving the reader task and registry
+    // alive; selecting the reader covers close, FIN, reset, and read errors.
+    let mut read_loop = Box::pin(run_read_loop(read, &state, shutdown_rx));
+    let (read_exit, writer_finished) = tokio::select! {
+        exit = &mut read_loop => (Some(exit), false),
+        result = &mut write_handle => {
+            if let Err(e) = result {
+                log::error!("space={space_id} ws: write task join error err={e}");
+            }
+            (None, true)
+        }
+    };
+    // Cancel/drop the losing read future now so it releases its split half.
+    drop(read_loop);
 
-    unregister_connection(&conn_registry, space_id).await;
+    // Exact-id removal breaks the registry-sender -> channel-receiver ->
+    // writer-task -> WebSocket-write-half ownership chain.
+    unregister_connection(&conn_registry, space_id, connection_id).await;
 
-    if let Err(e) = write_handle.await {
-        log::error!("space={space_id} ws: write task join error err={e}");
+    if !writer_finished {
+        if matches!(
+            read_exit,
+            Some(ReadLoopExit::PeerClosed | ReadLoopExit::Shutdown)
+        ) {
+            let _ = state.response_tx.send(WriterCommand::Close);
+        }
+        // This is now the last per-connection sender; dropping it lets an
+        // abrupt-disconnect writer leave `recv()` and release the socket.
+        drop(state);
+
+        if tokio::time::timeout(WEBSOCKET_CLOSE_TIMEOUT, &mut write_handle)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "space={space_id} ws: writer did not close within {:?}; aborting task",
+                WEBSOCKET_CLOSE_TIMEOUT
+            );
+            write_handle.abort();
+            let _ = write_handle.await;
+        }
+    } else {
+        drop(state);
     }
     log::info!("space={space_id} ws: client disconnected");
     Ok(())
@@ -653,9 +757,13 @@ mod tests {
 
         send_direct_response(payload, &response_tx, sid, "test");
 
-        let bytes = response_rx
+        let bytes = match response_rx
             .try_recv()
-            .expect("should have received response");
+            .expect("should have received response")
+        {
+            WriterCommand::Message(Message::Binary(bytes)) => bytes,
+            other => panic!("expected binary writer command, got {other:?}"),
+        };
         let frame = WsFrame::decode(&bytes[..]).expect("should decode");
         match frame.payload {
             Some(ws_frame::Payload::DbResponse(resp)) => {
@@ -729,52 +837,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregister_connection_removes_closed_senders() {
+    async fn unregister_connection_removes_exact_open_sender_and_closes_channel() {
         let registry = new_connection_registry();
-        let (tx1, rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let sid = test_space_id();
+        let auth = AuthContext::anonymous(sid);
 
-        {
-            let mut reg = registry.lock().await;
-            reg.entry(sid).or_default().push(ClientConnection {
-                id: next_connection_id(),
-                sender: tx1,
-            });
-            reg.entry(sid).or_default().push(ClientConnection {
-                id: next_connection_id(),
-                sender: tx2,
-            });
-        }
+        let id = register_connection(&registry, sid, &auth, &tx).await;
+        drop(tx);
 
-        drop(rx1);
+        // The registry clone keeps the writer receiver open before cleanup.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
-        unregister_connection(&registry, sid).await;
+        unregister_connection(&registry, sid, id).await;
 
-        let reg = registry.lock().await;
-        let conns = reg.get(&sid).expect("entry should still exist");
-        assert_eq!(conns.len(), 1);
+        assert!(rx.recv().await.is_none(), "final sender must be released");
+        assert!(registry.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn unregister_connection_removes_entry_when_all_closed() {
+    async fn unregister_connection_only_removes_requested_connection() {
         let registry = new_connection_registry();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
         let sid = test_space_id();
+        let auth = AuthContext::anonymous(sid);
 
-        {
-            let mut reg = registry.lock().await;
-            reg.entry(sid).or_default().push(ClientConnection {
-                id: next_connection_id(),
-                sender: tx,
-            });
-        }
+        let id1 = register_connection(&registry, sid, &auth, &tx1).await;
+        let id2 = register_connection(&registry, sid, &auth, &tx2).await;
+        drop((tx1, tx2));
 
-        drop(rx);
-        unregister_connection(&registry, sid).await;
+        unregister_connection(&registry, sid, id1).await;
 
         let reg = registry.lock().await;
-        assert!(reg.get(&sid).is_none());
+        let conns = reg.get(&sid).expect("second connection remains");
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].id, id2);
+        drop(reg);
+        assert!(rx1.recv().await.is_none());
+        assert!(matches!(
+            rx2.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        unregister_connection(&registry, sid, id2).await;
+        assert!(rx2.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -782,7 +892,7 @@ mod tests {
         let registry = new_connection_registry();
         let sid = test_space_id();
 
-        unregister_connection(&registry, sid).await;
+        unregister_connection(&registry, sid, next_connection_id()).await;
         assert!(registry.lock().await.is_empty());
     }
 
@@ -797,8 +907,11 @@ mod tests {
         }
     }
 
-    fn decode_broadcast(bytes: &[u8]) -> ProtoBroadcast {
-        let frame = WsFrame::decode(bytes).expect("should decode WsFrame");
+    fn decode_broadcast(command: WriterCommand) -> ProtoBroadcast {
+        let WriterCommand::Message(Message::Binary(bytes)) = command else {
+            panic!("expected binary writer command")
+        };
+        let frame = WsFrame::decode(&bytes[..]).expect("should decode WsFrame");
         match frame.payload {
             Some(ws_frame::Payload::Broadcast(b)) => b,
             other => panic!("expected Broadcast payload, got {:?}", other),
@@ -821,8 +934,8 @@ mod tests {
         let broadcast = make_broadcast();
         send_broadcast_to(&broadcast, &[&conn1, &conn2]);
 
-        let b1 = decode_broadcast(&rx1.try_recv().unwrap());
-        let b2 = decode_broadcast(&rx2.try_recv().unwrap());
+        let b1 = decode_broadcast(rx1.try_recv().unwrap());
+        let b2 = decode_broadcast(rx2.try_recv().unwrap());
         assert_eq!(b1.change_entry.as_ref().unwrap().uid, 42);
         assert_eq!(b2.change_entry.as_ref().unwrap().uid, 42);
     }
@@ -853,7 +966,7 @@ mod tests {
         // Originator should not receive a broadcast for its own change.
         assert!(rx1.try_recv().is_err());
         // The other client should.
-        let b = decode_broadcast(&rx2.try_recv().expect("other client gets broadcast"));
+        let b = decode_broadcast(rx2.try_recv().expect("other client gets broadcast"));
         assert_eq!(b.change_entry.as_ref().unwrap().uid, 42);
     }
 }
